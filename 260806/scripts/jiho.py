@@ -10,7 +10,7 @@
     python3 scripts/jiho.py sheets     # 요약 작성용 컨택트시트
     python3 scripts/jiho.py build      # index.html + LOG.md 생성
     python3 scripts/jiho.py all        # 위 전체를 순서대로
-    python3 scripts/jiho.py serve      # 편집 가능한 갤러리 로컬 서버
+    python3 scripts/jiho.py serve      # 편집 가능한 갤러리 로컬 서버 (--lan: 다른 기기에서도 접속)
     python3 scripts/jiho.py undo       # 마지막 이동(정리/중복격리) 되돌리기
     python3 scripts/jiho.py trash      # 중복 보관함 확인 / --empty 로 완전 삭제
     python3 scripts/jiho.py merge      # 브라우저에서 내보낸 수정본 반영
@@ -29,6 +29,7 @@ import math
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -1116,18 +1117,58 @@ def cmd_bundle(args):
     print(f"  · 확인: open {dist.relative_to(ROOT)}/index.html")
 
 
+LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+def _lan_addrs() -> list[str]:
+    """다른 기기에서 이 컴퓨터를 부를 수 있는 주소들 (대표 IP → 호스트네임 순)."""
+    out: list[str] = []
+    try:  # 기본 경로로 나가는 인터페이스의 IP — 실제로 패킷을 보내지는 않는다
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        out.append(s.getsockname()[0])
+        s.close()
+    except OSError:
+        pass
+    host = socket.gethostname()
+    try:
+        for info in socket.getaddrinfo(host, None, socket.AF_INET):
+            ip = info[4][0]
+            if not ip.startswith("127."):
+                out.append(ip)
+    except OSError:
+        pass
+    if host:
+        out.append(f"{host}.local")
+    return list(dict.fromkeys(out))
+
+
 def cmd_serve(args):
     if not (ROOT / "index.html").exists():
         cmd_build(argparse.Namespace(size=args.size))
     _Handler.readonly = args.readonly
-    srv = ThreadingHTTPServer((args.host, args.port), _Handler)
-    print(f"serve: http://{args.host}:{args.port}/  (Ctrl-C 로 종료)")
+    host = "0.0.0.0" if args.lan else args.host
+    try:
+        srv = ThreadingHTTPServer((host, args.port), _Handler)
+    except OSError as e:
+        sys.exit(f"serve: {host}:{args.port} 를 열 수 없습니다 — {e}\n"
+                 f"  · 포트가 이미 쓰이는 중이면 --port 8766 처럼 다른 번호를 쓰세요.\n"
+                 f"  · 그 IP 가 이 컴퓨터 것이 아니면 --lan (모든 주소에서 받기) 을 쓰세요.")
+    shown = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+    print(f"serve: http://{shown}:{args.port}/  (Ctrl-C 로 종료)")
     if args.readonly:
         print("  · 읽기 전용 — 저장 API 를 막았습니다. 외부 공유용으로 안전합니다.")
     else:
         print("  · 사진을 클릭하면 요약·날짜·장소를 바로 고칠 수 있고 data/*.json 에 저장됩니다.")
-    if args.host not in ("127.0.0.1", "localhost"):
-        print("  ! 외부에 열려 있습니다. 공유용이면 --readonly 를 같이 쓰세요.")
+    if host in LOCAL_HOSTS:
+        print("  · 이 컴퓨터에서만 열립니다 — 다른 기기에서도 보려면 --lan 을 붙이세요.")
+    else:
+        print("  · 다른 기기에서는 이 주소로 접속하세요:")
+        for a in _lan_addrs():
+            print(f"      http://{a}:{args.port}/")
+        print(f"    (열리지 않으면 이 컴퓨터의 방화벽에서 {args.port} 포트를 허용해 주세요)")
+        if not args.readonly:
+            print("  ! 같은 네트워크의 누구나 수정할 수 있습니다. 공유용이면 --readonly 를 같이 쓰세요.")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -1213,7 +1254,11 @@ def main():
 
     p = sub.add_parser("serve", help="갤러리 로컬 서버 (편집 가능)")
     p.add_argument("--port", type=int, default=8765)
-    p.add_argument("--host", default="127.0.0.1", help="0.0.0.0 이면 같은 와이파이에서 접속 가능")
+    p.add_argument("--host", default="127.0.0.1",
+                   help="바인딩할 주소 (기본 127.0.0.1 — 이 컴퓨터에서만). "
+                        "특정 랜카드 주소만 열려면 그 IP 를 적으세요")
+    p.add_argument("--lan", action="store_true",
+                   help="같은 네트워크의 다른 기기에서도 접속 허용 (--host 0.0.0.0 과 같음)")
     p.add_argument("--readonly", action="store_true", help="저장 API 차단 — 공유용")
     p.add_argument("--size", type=int, default=480)
     p.set_defaults(func=cmd_serve)
@@ -1413,7 +1458,27 @@ body.edit .shot.nosum{outline:2px dashed var(--warn);outline-offset:-2px}
   border-radius:13px;padding:13px 15px;font:19px/1.55 inherit;resize:vertical}
 #lb textarea:focus,#lb input:focus{outline:0;border-color:var(--accent);background:#fff;
   box-shadow:0 0 0 3px var(--soft)}
+/* 기본은 읽기 전용 — [✎ 수정]을 눌러야 고칠 수 있다 */
+#lb textarea[readonly],#lb input[readonly]{background:transparent;border-color:#f7f0ed;
+  cursor:pointer;resize:none;box-shadow:none}
+#lb textarea[readonly]:hover,#lb input[readonly]:hover{border-color:var(--accent);background:#fffdfc}
 #lb .hint{font-size:13px;color:var(--dim);margin-top:7px;line-height:1.55}
+/* 수정 중에만 보이는 것 / 볼 때만 보이는 것 */
+#lb .onlyedit{display:none}
+#lb.editing .onlyedit{display:block}
+#lb.editing .onlyview{display:none}
+/* 아직 저장하지 않은 변경이 있다 — 눈에 띄게 */
+#lb .unsaved{display:none;align-items:center;gap:8px;margin-top:18px;padding:11px 14px;
+  border-radius:13px;background:#fff8ec;border:1px solid #f0dcbb;color:#8a6a30;font-size:13px;
+  line-height:1.5}
+#lb.dirty .unsaved{display:flex}
+#lb .changed{border-color:var(--warn) !important;background:#fffdf7}
+#lb.dirty .row #saveBtn{animation:pulse 1.7s ease-in-out infinite}
+@keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(217,149,60,.5)}50%{box-shadow:0 0 0 8px rgba(217,149,60,0)}}
+@media(prefers-reduced-motion:reduce){#lb.dirty .row #saveBtn{animation:none}}
+#lb .row button[disabled]{opacity:.45;cursor:default}
+#lb .row button[disabled]:hover{border-color:var(--line)}
+#lb .row button.primary[disabled]:hover{border-color:var(--accent)}
 #lb .rel{display:grid;grid-template-columns:repeat(4,1fr);gap:7px}
 #lb .rel img{width:100%;aspect-ratio:1;object-fit:cover;border-radius:9px;cursor:pointer;
   border:2px solid transparent;transition:.15s;background:#f6efec}
@@ -1504,6 +1569,12 @@ body.edit .shot.nosum{outline:2px dashed var(--warn);outline-offset:-2px}
         브라우저에만 쌓입니다. 그걸 <code>pending_edits.json</code> 으로 내려받는 버튼입니다.
         받은 파일을 <code>data/</code> 에 넣고 <code>jiho.py merge</code> 를 실행하면 반영됩니다.
         <b>서버로 열었다면 저장이 곧바로 파일에 들어가므로 쓸 일이 없습니다.</b></dd>
+    <dt>사진 크게 보기 → ✎ 수정</dt>
+    <dd>사진을 크게 열면 요약·촬영 일시·장소는 <b>읽기 전용</b>입니다.
+        <b>✎ 수정</b>을 누르면(또는 그 칸을 그냥 눌러도) 입력칸이 열리고 <b>저장</b> 버튼이 나타납니다.
+        고친 곳은 노란 테두리로 표시되고 "아직 저장하지 않은 변경이 있습니다" 알림이 뜹니다.
+        저장하지 않은 채 다른 사진으로 넘어가거나 닫으면 한 번 더 물어봅니다.
+        <code>Ctrl(⌘)+Enter</code> 로도 저장할 수 있습니다.</dd>
     <dt>사진 크게 보기 → 장소 일괄</dt>
     <dd>그 사진의 <b>GPS 좌표가 같은 사진 전부</b>의 장소 이름을 한 번에 바꿉니다.
         예를 들어 자동으로 "서울 마포구 아현동"이라고 붙은 곳을 "우리 집"으로 바꾸면,
@@ -1523,16 +1594,19 @@ body.edit .shot.nosum{outline:2px dashed var(--warn);outline-offset:-2px}
   <aside>
     <h4 id="lbTitle"></h4><div class="sub" id="lbSub"></div>
     <label>요약</label>
-    <textarea id="fSum" rows="4" placeholder="이 순간을 한 줄로…"></textarea>
+    <textarea id="fSum" rows="4" placeholder="이 순간을 한 줄로…" readonly></textarea>
     <label>촬영 일시</label>
-    <input id="fDate" placeholder="2026-06-13 09:03">
+    <input id="fDate" placeholder="2026-06-13 09:03" readonly>
     <div class="hint" id="dHint"></div>
     <label>장소</label>
-    <input id="fPlace" placeholder="예: 서울 마포구 상암동">
+    <input id="fPlace" placeholder="예: 서울 마포구 상암동" readonly>
     <div class="hint" id="pHint"></div>
+    <div class="unsaved">✎ 아직 저장하지 않은 변경이 있습니다 — <b>[저장]</b>을 눌러야 반영됩니다</div>
     <div class="row">
-      <button class="primary" id="saveBtn">저장</button>
-      <button id="savePlaceBtn" title="같은 좌표의 사진 전부에 적용">장소 일괄</button>
+      <button class="onlyview" id="editFieldsBtn" title="요약·촬영 일시·장소를 고칩니다">✎ 수정</button>
+      <button class="primary onlyedit" id="saveBtn" disabled>저장</button>
+      <button class="onlyedit" id="cancelBtn">취소</button>
+      <button class="onlyedit" id="savePlaceBtn" title="같은 좌표의 사진 전부에 적용">장소 일괄</button>
     </div>
     <label id="relLabel">이 무렵 사진</label>
     <div class="rel" id="fRel"></div>
@@ -1620,12 +1694,49 @@ function render(){
   const t=stage.querySelector('.livetoggle');
   if(t) t.onclick=e=>{e.stopPropagation();liveOn=!liveOn;render();};
 }
+// ── 읽기 전용 ↔ 수정 상태 ──────────────────────────────
+// 라이트박스는 열자마자 읽기 전용이다. [✎ 수정]을 눌러야 입력칸이 열리고
+// 저장 버튼이 나타난다. 값이 바뀌면 그 사실이 눈에 보이게 표시된다.
+const FIELDS=['#fSum','#fDate','#fPlace'];
+let base={sum:'',date:'',place:''};
+const vals=()=>({sum:$('#fSum').value,date:$('#fDate').value,place:$('#fPlace').value});
+const isDirty=()=>lb.classList.contains('dirty');
+
+function markDirty(){
+  const v=vals(), chg=[v.sum!==base.sum,v.date!==base.date,v.place!==base.place];
+  FIELDS.forEach((sel,k)=>$(sel).classList.toggle('changed',chg[k]));
+  const any=chg.some(Boolean);
+  lb.classList.toggle('dirty',any);
+  $('#saveBtn').disabled=!any;
+  return any;
+}
+function setEditing(on){
+  lb.classList.toggle('editing',on);
+  FIELDS.forEach(sel=>$(sel).readOnly=!on);
+  if(!on){ FIELDS.forEach(sel=>$(sel).classList.remove('changed'));
+           lb.classList.remove('dirty'); $('#saveBtn').disabled=true; }
+}
+function fillFields(){          // 지금 사진의 값으로 되돌리고 기준선을 새로 잡는다
+  const d=shots[cur].dataset;
+  $('#fSum').value=d.cap||''; $('#fDate').value=d.taken||''; $('#fPlace').value=d.place||'';
+  base=vals(); markDirty();
+}
+// 저장하지 않은 변경이 있으면 다른 사진으로 넘어가거나 닫기 전에 묻는다
+async function leaveGuard(){
+  if(!isDirty()) return true;
+  if(confirm('저장하지 않은 변경이 있습니다.\n\n확인 = 저장하고 이동\n취소 = 변경을 버리고 이동'))
+    return await save();
+  return true;
+}
+async function go(i){ if(await leaveGuard()) show(i); }
+
 function show(i){
   cur=(i+shots.length)%shots.length; const s=shots[cur], d=s.dataset;
   render();
+  setEditing(false);
   $('#lbTitle').textContent = d.taken || '(촬영 일시 없음)';
   $('#lbSub').textContent = `${d.file} · ${d.path}`;
-  $('#fSum').value=d.cap||''; $('#fDate').value=d.taken||''; $('#fPlace').value=d.place||'';
+  fillFields();
   $('#dHint').textContent = d.dsrc ? `출처: ${d.dsrc}` : '메타데이터에 촬영 일시가 없습니다';
   renderRelated(cur);
   const psrc={manual:'직접 입력',gps:'사진 GPS','manual-day':'그 날짜 지정',
@@ -1635,7 +1746,10 @@ function show(i){
     : 'GPS 정보 없음') + ` · 현재 출처: ${psrc}`;
   lb.classList.add('on');
 }
-function close(){lb.classList.remove('on');stage.innerHTML='';}
+async function close(){
+  if(!await leaveGuard()) return;
+  setEditing(false); lb.classList.remove('on'); stage.innerHTML='';
+}
 
 // 비슷한 사진: 요약문 의미 유사도 우선, 부족하면 같은 날 컷으로 채운다
 const REL_COUNT=8;
@@ -1660,7 +1774,7 @@ function renderRelated(i){
     const cap=(o.s.dataset.cap||'').replace(/"/g,'&quot;');
     return `<img src="${src}" data-i="${o.k}" title="${o.s.dataset.taken} · ${cap}" loading="lazy">`;
   }).join('');
-  box.querySelectorAll('img').forEach(im=>im.onclick=()=>show(+im.dataset.i));
+  box.querySelectorAll('img').forEach(im=>im.onclick=()=>go(+im.dataset.i));
   $('#relLabel').textContent = scored.length ? '비슷한 사진' : '이 무렵 사진';
 }
 
@@ -1711,14 +1825,35 @@ async function save(){
       ? patch.summary.replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c])) : '<i>요약 없음</i>';
     s.classList.toggle('nosum',!patch.summary);
     $('#lbTitle').textContent = patch.taken_local || '(촬영 일시 없음)';
-  }catch(e){ say('저장 실패: '+e.message,'err'); }
+    base=vals(); setEditing(false);      // 저장했으니 다시 읽기 전용으로
+    return true;
+  }catch(e){ say('저장 실패: '+e.message,'err'); return false; }
 }
 
+$('#editFieldsBtn').onclick=()=>{ setEditing(true); $('#fSum').focus(); };
+function cancelEdit(){
+  const had=isDirty();
+  if(had && !confirm('고친 내용을 버리고 원래대로 되돌릴까요?')) return false;
+  fillFields(); setEditing(false);
+  if(had) say('변경을 되돌렸습니다');
+  return true;
+}
+$('#cancelBtn').onclick=cancelEdit;
 $('#saveBtn').onclick=save;
+// 읽기 전용 칸을 그냥 눌러도 수정이 시작된다
+FIELDS.forEach(sel=>{
+  const el=$(sel);
+  el.addEventListener('input',markDirty);
+  el.addEventListener('mousedown',e=>{
+    if(!el.readOnly) return;
+    e.preventDefault(); setEditing(true); el.focus();
+  });
+});
 $('#savePlaceBtn').onclick=async()=>{
   const d=shots[cur].dataset, label=$('#fPlace').value.trim();
   if(!d.geokey) return say('GPS 좌표가 없어 일괄 적용할 수 없습니다','err');
   try{ await api('/api/place',{geo_key:d.geokey,label});
+       d.place=label; base.place=label; markDirty();
        say(`좌표 ${d.geokey} 의 모든 사진 장소를 "${label}" 로 바꿨습니다`,'ok'); }
   catch(e){ say('실패: '+e.message,'err'); }
 };
@@ -1761,17 +1896,21 @@ shots.filter(s=>s.dataset.motion).forEach(s=>{
   s.addEventListener('mouseleave',()=>{if(v)v.pause();});
 });
 lb.querySelector('.close').onclick=close;
-lb.querySelector('.prev').onclick=e=>{e.stopPropagation();show(cur-1)};
-lb.querySelector('.next').onclick=e=>{e.stopPropagation();show(cur+1)};
+lb.querySelector('.prev').onclick=e=>{e.stopPropagation();go(cur-1)};
+lb.querySelector('.next').onclick=e=>{e.stopPropagation();go(cur+1)};
 lb.addEventListener('click',e=>{if(e.target===lb)close()});
 document.addEventListener('keydown',e=>{
   if(!lb.classList.contains('on'))return;
   const typing=/INPUT|TEXTAREA/.test(document.activeElement.tagName);
-  if(e.key==='Escape')close();
-  if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();save();}
+  // 수정 중이면 Esc 는 먼저 수정을 접는다 — 한 번 더 눌러야 닫힌다
+  if(e.key==='Escape'){ if(lb.classList.contains('editing')) cancelEdit(); else close(); return; }
+  if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();
+    if(lb.classList.contains('editing')) save(); else $('#editFieldsBtn').click();}
   if(typing)return;
-  if(e.key==='ArrowLeft')show(cur-1); if(e.key==='ArrowRight')show(cur+1);
+  if(e.key==='ArrowLeft')go(cur-1); if(e.key==='ArrowRight')go(cur+1);
 });
+// 저장 안 한 채로 창을 닫거나 새로고침하면 브라우저가 한 번 더 묻는다
+window.addEventListener('beforeunload',e=>{ if(isDirty()){e.preventDefault();e.returnValue='';} });
 
 // 스크롤 위치에 따라 현재 달을 네비에서 강조
 (function(){
@@ -1797,12 +1936,13 @@ document.addEventListener('keydown',e=>{if(e.key==='Escape')help.classList.remov
 
 $('#editBtn').onclick=e=>{document.body.classList.toggle('edit');
   e.target.classList.toggle('on',document.body.classList.contains('edit'));};
-$('#nextBtn').onclick=()=>{
+$('#nextBtn').onclick=async()=>{
   const i=shots.findIndex((s,k)=>k>cur&&s.classList.contains('nosum'));
   const j=i>=0?i:shots.findIndex(s=>s.classList.contains('nosum'));
   if(j<0)return say('요약이 비어 있는 항목이 없습니다','ok');
+  if(!await leaveGuard())return;
   document.body.classList.add('edit'); $('#editBtn').classList.add('on');
-  show(j); setTimeout(()=>$('#fSum').focus(),60);
+  show(j); setEditing(true); setTimeout(()=>$('#fSum').focus(),60);
 };
 $('#rebuildBtn').onclick=async()=>{ say('다시 빌드 중…');
   try{ await api('/api/rebuild',{}); location.reload(); }catch(e){ say('실패: '+e.message,'err'); } };
