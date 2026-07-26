@@ -16,6 +16,9 @@
     python3 scripts/jiho.py merge      # 브라우저에서 내보낸 수정본 반영
 
 새 사진은 staging/ 에 넣고 `./scripts/run_all.sh` 만 다시 돌리면 된다.
+
+돌잔치 영상용 태그(쓸 컷 / 인물 / 얼굴 위치 / 자막 / 비공개)는 serve 로 띄운
+갤러리의 [🎬 영상 태깅] 에서 모으고 data/edits.json 에 쌓인다.
 """
 
 from __future__ import annotations
@@ -59,12 +62,25 @@ SUMMARY_JSON = DATA / "summaries.json"        # 파일명 → 한 줄 요약
 OVERRIDES_JSON = DATA / "overrides.json"      # 파일별 날짜/장소 수정
 DAY_PLACES_JSON = DATA / "day_places.json"    # 날짜별 장소 일괄 지정 (GPS 없는 사진용)
 NOTES_JSON = DATA / "notes.json"              # 생일·제목·날짜별 메모
+EDITS_JSON = DATA / "edits.json"              # 영상 제작용 태그 (선별·인물·얼굴 위치…)
 MANIFEST = DATA / "move_manifest.jsonl"       # organize 이동 기록 (undo 용)
 
 TZ_OFFSET = 9.0          # Asia/Seoul
 GEO_PRECISION = 3        # 좌표 반올림 자리수(≈100m) → 같은 장소로 묶는 단위
 IGNORE = {".DS_Store", "Thumbs.db"}
 NO_PLACE = "장소 미상"
+
+# ---- 영상 태그 --------------------------------------------------------
+# 돌잔치 영상을 자동으로 만들려면 "이 사진을 쓸지 / 누가 나오는지 / 어디를
+# 잘라야 얼굴이 살아남는지"가 데이터에 있어야 한다. 사진마다 한 번씩 눌러
+# 모으는 값들이고, 전부 data/edits.json 한 곳에 들어간다.
+PICK_LABELS = {0: "제외", 1: "보통", 2: "꼭"}
+FACE_LABELS = {"s": "작게", "m": "보통", "l": "크게"}
+SHORT_MAX = 40           # 화면 자막용 짧은 문구 길이 상한
+# 인물 태그 기본 목록 — 지호는 거의 모든 컷에 있으니 넣지 않는다("누가 같이
+# 나왔나"를 모으는 것이 목적). notes.json 의 "roster" 로 바꿀 수 있다.
+DEFAULT_ROSTER = ["엄마", "아빠", "할머니", "할아버지",
+                  "외할머니", "외할아버지", "이모", "삼촌", "친구"]
 
 
 # --------------------------------------------------------------------- 공통
@@ -434,6 +450,10 @@ def cmd_merge(args):
             _save_note({"day": key[len("__note__"):], "text": patch.get("note", "")})
         elif key.startswith("__dayplace__"):
             _save_day_place({"day": key[len("__dayplace__"):], "label": patch.get("dayplace", "")})
+        elif key.startswith("__tag__"):
+            _save_tag({"file": key[len("__tag__"):], **patch})
+        elif key.startswith("__roster__"):
+            _save_note({"roster": patch.get("roster", [])})
         else:
             _save_item({"file": key, **patch})
         n += 1
@@ -663,19 +683,35 @@ def cmd_build(args):
     notes = load_json(NOTES_JSON, {})
     bday = birthday(notes)
 
+    edits = load_edits()
+
     days = group_days(items)
     review = [m for m in items if not m.get("taken_local")]
 
-    _write_log_md(days, review, summaries, notes, bday)
-    _write_gallery(days, review, summaries, notes, bday, args.size)
+    _write_log_md(days, review, summaries, notes, bday, edits)
+    _write_gallery(days, review, summaries, notes, bday, args.size, edits=edits)
     total = sum(len(v) for d in days.values() for v in d.values())
     print(f"build: index.html · LOG.md  ({len(days)}일 / {total}컷 / 확인필요 {len(review)})")
     missing = [m for m in items if not summaries.get(m["file"])]
     if missing:
         print(f"  · 요약 없는 항목 {len(missing)}개 — 갤러리에서 직접 쓰거나 `jiho.py sheets` 사용")
+    print("  · " + tag_progress(items, edits))
 
 
-def _write_log_md(days, review, summaries, notes, bday):
+def tag_progress(items, edits) -> str:
+    """영상 태깅이 얼마나 됐는지 한 줄로."""
+    picked = [edits.get(m["file"], {}).get("pick") for m in items]
+    done = sum(1 for p in picked if p is not None)
+    must = sum(1 for p in picked if p == 2)
+    drop = sum(1 for p in picked if p == 0)
+    focus = sum(1 for m in items if edits.get(m["file"], {}).get("focus"))
+    priv = sum(1 for m in items if edits.get(m["file"], {}).get("private"))
+    return (f"영상 태깅 {done}/{len(items)} — 꼭 {must} · 제외 {drop} · "
+            f"얼굴 위치 {focus} · 비공개 {priv}")
+
+
+def _write_log_md(days, review, summaries, notes, bday, edits=None):
+    edits = edits or {}
     total = sum(len(v) for d in days.values() for v in d.values())
     L = [f"# {notes.get('title', '지호의 첫 1년')} — 성장 로그", ""]
     if bday:
@@ -695,7 +731,10 @@ def _write_log_md(days, review, summaries, notes, bday):
                 s = summaries.get(m["file"], "")
                 tag = "🎬" if m["kind"] == "video" else "📷"
                 dur = f" _{m['duration_sec']}초_" if m.get("duration_sec") else ""
-                L.append(f"- `{m['taken_local'][11:16]}` {tag} {s or '_(요약 없음)_'}{dur}  "
+                e = edits.get(m["file"], {})
+                mark = {2: " ★", 0: " ✕"}.get(e.get("pick"), "") + (" 🔒" if e.get("private") else "")
+                who = f" _({', '.join(e['people'])})_" if e.get("people") else ""
+                L.append(f"- `{m['taken_local'][11:16]}` {tag}{mark} {s or '_(요약 없음)_'}{dur}{who}  "
                          f"<sub>{m['file']}</sub>")
         L.append("")
     if review:
@@ -718,7 +757,7 @@ def shot_shape(m) -> str:
     return "ls" if r > 1.15 else "pt" if r < 0.87 else "sq"
 
 
-def _shot_html(m, summaries, size, out=None, lite=False, keep=None):
+def _shot_html(m, summaries, size, out=None, lite=False, keep=None, edits=None):
     """lite=True 면 원본 대신 썸네일을 가리켜, 썸네일만으로 굴러가는 번들을 만든다."""
     out = out or ROOT
     thumb = _thumb_path(m, size)
@@ -743,14 +782,39 @@ def _shot_html(m, summaries, size, out=None, lite=False, keep=None):
         "auto": m.get("place_auto") or "", "dsrc": m.get("date_source") or "",
         "psrc": m.get("place_source") or "",
     }
+    # 영상 태그 — 갤러리에서 눌러 모으고, 다시 열었을 때 그대로 보이게 심어둔다
+    e = (edits or {}).get(m["file"], {})
+    pick, foc = e.get("pick"), e.get("focus")
+    data.update({
+        "pick": "" if pick is None else str(pick),
+        "priv": "1" if e.get("private") else "",
+        "focus": f"{foc[0]},{foc[1]}" if foc else "",
+        "face": e.get("face") or "",
+        "ppl": ",".join(e.get("people") or []),
+        "short": e.get("short") or "",
+    })
     attrs = " ".join(f'data-{k}="{html.escape(str(v), quote=True)}"' for k, v in data.items())
     return (f'<figure class="shot {shot_shape(m)}{" vid" if vid else ""}'
-            f'{" live" if motion else ""}{" nosum" if not s else ""}" {attrs}>'
+            f'{" live" if motion else ""}{" nosum" if not s else ""}'
+            f'{f" pick{pick}" if pick is not None else " untagged"}'
+            f'{" priv" if e.get("private") else ""}" {attrs}>'
             f'<img src="{html.escape(rel)}" loading="lazy" alt="">'
             f'{"<span class=play>▶</span>" if vid else ""}{dur}'
             f'{"<span class=livebadge>◉ LIVE</span>" if motion else ""}'
             f'<span class="src">{src_badge}</span>'
+            f'{_tagmark_html(e)}'
             f'<figcaption>{html.escape(s) or "<i>요약 없음</i>"}</figcaption></figure>')
+
+
+def _tagmark_html(e) -> str:
+    """격자에서 한눈에 보이는 태그 표시 — 선별 등급 / 비공개 / 얼굴 위치."""
+    marks = "".join(filter(None, [
+        {2: "★", 1: "·", 0: "✕"}.get(e.get("pick"), ""),
+        "🔒" if e.get("private") else "",
+        "◎" if e.get("focus") else "",
+        f"<em>{len(e['people'])}</em>" if e.get("people") else "",
+    ]))
+    return f'<span class="tagmark">{marks}</span>' if marks else ""
 
 
 def _text_vectors(ordered, summaries, notes, day_places):
@@ -789,9 +853,11 @@ def _text_vectors(ordered, summaries, notes, day_places):
     return vecs, {t: round(w, 4) for t, w in idf.items()}
 
 
-def _write_gallery(days, review, summaries, notes, bday, size, out=None, lite=False, keep=None):
+def _write_gallery(days, review, summaries, notes, bday, size, out=None, lite=False, keep=None,
+                   edits=None):
     out = out or ROOT
-    shot = lambda m: _shot_html(m, summaries, size, out, lite, keep)  # noqa: E731
+    edits = edits if edits is not None else load_edits()
+    shot = lambda m: _shot_html(m, summaries, size, out, lite, keep, edits)  # noqa: E731
     day_places = load_json(DAY_PLACES_JSON, {})
     # 월 단위로 묶어 네비게이션을 짧게 (73개 날짜 알약 → 11개 월 알약)
     months: dict[str, list[str]] = {}
@@ -896,7 +962,9 @@ def _write_gallery(days, review, summaries, notes, bday, size, out=None, lite=Fa
         .replace("{{NOSUM}}", str(nosum)).replace("{{REVIEW}}", str(len(review)))
         .replace("{{NAV}}", "".join(nav)).replace("{{CARDS}}", "".join(cards))
         .replace("{{VECS}}", json.dumps(vecs, ensure_ascii=False, separators=(",", ":")))
-        .replace("{{IDF}}", json.dumps(idf, ensure_ascii=False, separators=(",", ":"))),
+        .replace("{{IDF}}", json.dumps(idf, ensure_ascii=False, separators=(",", ":")))
+        .replace("{{ROSTER}}", json.dumps(roster_of(notes), ensure_ascii=False,
+                                          separators=(",", ":"))),
         encoding="utf-8")
 
 
@@ -974,6 +1042,10 @@ class _Handler(SimpleHTTPRequestHandler):
             elif self.path == "/api/note":
                 self._json(_save_note(payload))
                 schedule_rebuild()
+            elif self.path == "/api/tag":
+                # 태그는 연달아 눌러 들어오므로 조금 더 모았다가 다시 만든다
+                self._json(_save_tag(payload))
+                schedule_rebuild(delay=5.0)
             elif self.path == "/api/rebuild":
                 cmd_build(argparse.Namespace(size=payload.get("size", 480)))
                 self._json({"ok": True})
@@ -1064,8 +1136,91 @@ def _save_note(p):
     for key in ("title", "birthday"):
         if key in p:
             notes[key] = p[key]
+    if "roster" in p:                    # 인물 태그 목록 (갤러리에서 사람 추가)
+        seen, roster = set(), []
+        for name in p["roster"] or []:
+            name = str(name).strip()
+            if name and name not in seen:
+                seen.add(name)
+                roster.append(name)
+        notes["roster"] = roster
     save_json(NOTES_JSON, notes)
     return {"ok": True}
+
+
+# --------------------------------------------------------------- 영상 태그
+
+def load_edits() -> dict:
+    return load_json(EDITS_JSON, {})
+
+
+def roster_of(notes) -> list[str]:
+    r = [str(x).strip() for x in (notes.get("roster") or []) if str(x).strip()]
+    return r or list(DEFAULT_ROSTER)
+
+
+def _clean_tag(entry: dict, p: dict) -> dict:
+    """넘어온 값만 골라 정규화해서 덮어쓴다. 빈 값이면 그 키를 지운다."""
+    if "pick" in p:
+        v = p["pick"]
+        if v in (None, "", -1):
+            entry.pop("pick", None)
+        else:
+            entry["pick"] = max(0, min(2, int(v)))
+    if "private" in p:
+        if p["private"]:
+            entry["private"] = True
+        else:
+            entry.pop("private", None)
+    if "focus" in p:
+        f = p["focus"]
+        if not f:
+            entry.pop("focus", None)
+        else:
+            x, y = (round(min(1.0, max(0.0, float(v))), 4) for v in (f[0], f[1]))
+            entry["focus"] = [x, y]
+    if "face" in p:
+        v = (p["face"] or "").strip()
+        if v in FACE_LABELS:
+            entry["face"] = v
+        else:
+            entry.pop("face", None)
+    if "people" in p:
+        seen, names = set(), []
+        for name in p["people"] or []:
+            name = str(name).strip()
+            if name and name not in seen:
+                seen.add(name)
+                names.append(name)
+        if names:
+            entry["people"] = names
+        else:
+            entry.pop("people", None)
+    if "short" in p:
+        text = re.sub(r"\s+", " ", (p["short"] or "")).strip()[:SHORT_MAX]
+        if text:
+            entry["short"] = text
+        else:
+            entry.pop("short", None)
+    return entry
+
+
+def _save_tag(p):
+    """한 파일의 영상 태그(선별·비공개·얼굴 위치·인물·짧은 자막) 저장."""
+    name = p.get("file")
+    if not name:
+        return {"ok": False, "error": "file 누락"}
+    edits = load_edits()
+    try:
+        entry = _clean_tag(dict(edits.get(name, {})), p)
+    except (TypeError, ValueError, IndexError) as e:
+        return {"ok": False, "error": f"값을 읽지 못했습니다: {e}"}
+    if entry:
+        edits[name] = entry
+    else:
+        edits.pop(name, None)
+    save_json(EDITS_JSON, edits)
+    return {"ok": True, "tag": entry}
 
 
 def cmd_bundle(args):
@@ -1074,18 +1229,30 @@ def cmd_bundle(args):
     포트를 못 여는 환경에서 가족에게 공유할 때 쓴다. dist/ 폴더째 어디든
     (정적 호스팅·USB·에어드롭) 올리면 되고, 서버가 필요 없다.
     영상/모션 클립은 기본으로 빼고, --with-video / --with-motion 으로 넣는다.
+    '비공개'로 표시한 사진은 남에게 보여줄 번들이므로 기본으로 뺀다.
     """
     dist = ROOT / args.out
     meta = load_json(META_JSON, {"items": []})
     items = apply_overrides(meta["items"])
     summaries = load_json(SUMMARY_JSON, {})
     notes = load_json(NOTES_JSON, {})
+    edits = load_edits()
     bday = birthday(notes)
+
+    hidden = [m for m in items if edits.get(m["file"], {}).get("private")]
+    if hidden and not args.with_private:
+        items = [m for m in items if not edits.get(m["file"], {}).get("private")]
 
     if dist.exists():
         shutil.rmtree(dist)
     (dist / "gallery").mkdir(parents=True)
     shutil.copytree(THUMBS, dist / "gallery" / "thumbs")
+    if hidden and not args.with_private:
+        # 페이지에서 빠져도 썸네일 파일이 남으면 주소만 알면 보인다 — 같이 지운다
+        for m in hidden:
+            stem = re.sub(r"[^A-Za-z0-9._-]", "_", m["file"])
+            for p in (dist / "gallery" / "thumbs").glob(f"*_{stem}.jpg"):
+                p.unlink()
 
     keep: set[str] = set()
     for m in items:
@@ -1104,7 +1271,7 @@ def cmd_bundle(args):
     days = group_days(items)
     review = [m for m in items if not m.get("taken_local")]
     _write_gallery(days, review, summaries, notes, bday, args.size,
-                   out=dist, lite=True, keep=keep)
+                   out=dist, lite=True, keep=keep, edits=edits)
 
     total = sum(p.stat().st_size for p in dist.rglob("*") if p.is_file())
     print(f"bundle: {dist.relative_to(ROOT)}/  ({total / 1e6:.1f}MB, 파일 "
@@ -1114,6 +1281,9 @@ def cmd_bundle(args):
         print("  · 영상은 포스터만 — 넣으려면 --with-video (원본 218MB)")
     if not args.with_motion:
         print("  · 모션 클립 제외 — 넣으려면 --with-motion (58MB)")
+    if hidden:
+        print(f"  · 비공개 {len(hidden)}장 " + ("포함됨 (--with-private)" if args.with_private
+                                              else "제외 — 썸네일까지 뺐습니다"))
     print(f"  · 확인: open {dist.relative_to(ROOT)}/index.html")
 
 
@@ -1250,6 +1420,8 @@ def main():
     p.add_argument("--size", type=int, default=480)
     p.add_argument("--with-video", action="store_true", help="영상 원본도 포함 (+218MB)")
     p.add_argument("--with-motion", action="store_true", help="모션 클립도 포함 (+58MB)")
+    p.add_argument("--with-private", action="store_true",
+                   help="'비공개'로 표시한 사진도 포함 (기본은 제외)")
     p.set_defaults(func=cmd_bundle)
 
     p = sub.add_parser("serve", help="갤러리 로컬 서버 (편집 가능)")
@@ -1418,6 +1590,15 @@ body.edit .shot img{cursor:zoom-in}
 .shot.live:hover .livebadge{background:var(--accent);color:#fff}
 .shot video.preview{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
 body.edit .shot.nosum{outline:2px dashed var(--warn);outline-offset:-2px}
+/* 영상 태그가 격자에서도 보이게 — ★꼭 / ✕제외 / 🔒비공개 / ◎얼굴위치 */
+.shot .tagmark{position:absolute;left:7px;bottom:7px;z-index:3;background:rgba(255,255,255,.94);
+  border-radius:999px;padding:2px 8px;font-size:11px;color:var(--accent-ink);letter-spacing:.05em;
+  box-shadow:0 1px 4px rgba(0,0,0,.14)}
+.shot .tagmark em{font-style:normal;opacity:.6;font-size:10px;margin-left:2px}
+.shot.pick0{opacity:.4;filter:grayscale(.75)}
+.shot.pick0:hover{opacity:.9;filter:none}
+.shot.pick2{outline:2px solid var(--accent);outline-offset:-2px}
+body.onlyuntagged .shot:not(.untagged),body.onlyuntagged .day.hide{display:none}
 .rev{margin:12px 0 0;padding-left:18px;color:var(--dim);font-size:13px}
 .rev code{color:var(--fg)}
 
@@ -1479,6 +1660,43 @@ body.edit .shot.nosum{outline:2px dashed var(--warn);outline-offset:-2px}
 #lb .row button[disabled]{opacity:.45;cursor:default}
 #lb .row button[disabled]:hover{border-color:var(--line)}
 #lb .row button.primary[disabled]:hover{border-color:var(--accent)}
+/* ---------- 영상 태그 ---------- */
+/* 돌잔치 영상을 자동으로 만들 때 쓰는 값들. 누르면 바로 저장된다(따로 [저장] 없음). */
+#lb .tagbox{margin-top:18px;padding:15px 16px 17px;border-radius:16px;
+  background:#fdf7f4;border:1px solid #f1e3dd}
+#lb .tagbox>label:first-child{margin-top:0}
+#lb .tagbox .keys{float:right;font-size:11px;color:var(--dim);font-weight:400;letter-spacing:.02em}
+#lb .seg{display:flex;gap:7px}
+#lb .seg button{flex:1;border:1px solid var(--line);background:#fff;border-radius:11px;
+  padding:10px 0;font:14px inherit;cursor:pointer;color:var(--fg);transition:.12s}
+#lb .seg button:hover{border-color:var(--accent)}
+#lb .seg button.on{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:700}
+#lb .seg button.on.no{background:#b0998f;border-color:#b0998f}   /* 제외는 눈에 덜 띄는 색 */
+#lb .chips{display:flex;flex-wrap:wrap;gap:6px}
+#lb .chips button{border:1px solid var(--line);background:#fff;border-radius:999px;
+  padding:7px 12px;font:13px inherit;cursor:pointer;color:var(--fg);transition:.12s}
+#lb .chips button:hover{border-color:var(--accent)}
+#lb .chips button.on{background:var(--accent-ink);border-color:var(--accent-ink);color:#fff;font-weight:600}
+#lb .chips button i{font-style:normal;opacity:.45;font-size:10px;margin-left:5px;text-transform:uppercase}
+#lb .chips button.on i{opacity:.8}
+#lb .chips .add{border-style:dashed;color:var(--dim)}
+#lb .short{display:flex;gap:7px}
+#lb .short input{flex:1 1 auto;font-size:16px;padding:11px 13px}
+#lb .short button{flex:0 0 auto;padding:0 13px;border:1px solid var(--line);background:#fff;
+  border-radius:11px;cursor:pointer;font:13px inherit;color:var(--dim)}
+#lb .short button:hover{border-color:var(--accent);color:var(--accent-ink)}
+#lb .tagbox .row{margin-top:16px}
+/* 키보드가 없는 기기(폰·태블릿)에서도 얼굴 위치를 지울 수 있게 */
+#lb .linkbtn{background:none;border:0;color:var(--dim);font:12px inherit;cursor:pointer;
+  text-decoration:underline;padding:5px 0 0}
+#lb .linkbtn:hover{color:var(--accent-ink)}
+#lb .row button.on{background:var(--accent-ink);border-color:var(--accent-ink);color:#fff}
+/* 얼굴 위치 표시 — 사진 위 그 지점에 찍히는 과녁 */
+#lb .stage img{cursor:crosshair}
+#lb .stage .focus{position:absolute;width:34px;height:34px;margin:-17px 0 0 -17px;border-radius:50%;
+  border:2px solid #fff;box-shadow:0 0 0 2px var(--accent),0 3px 12px rgba(0,0,0,.35);
+  pointer-events:none;z-index:4}
+#lb .stage .focus::after{content:"";position:absolute;inset:13px;border-radius:50%;background:var(--accent)}
 #lb .rel{display:grid;grid-template-columns:repeat(4,1fr);gap:7px}
 #lb .rel img{width:100%;aspect-ratio:1;object-fit:cover;border-radius:9px;cursor:pointer;
   border:2px solid transparent;transition:.15s;background:#f6efec}
@@ -1531,6 +1749,8 @@ body.edit .shot.nosum{outline:2px dashed var(--warn);outline-offset:-2px}
   <div class="tools">
     <button id="editBtn" title="목록에서 사진 아래 설명을 바로 고칩니다">✎ 격자에서 바로 수정</button>
     <button id="nextBtn" title="설명이 비어 있는 다음 사진으로 건너뜁니다">다음 미작성 →</button>
+    <button id="tagBtn" title="돌잔치 영상에 쓸 컷을 고르고 인물·얼굴 위치를 찍습니다">🎬 영상 태깅</button>
+    <button id="untaggedBtn" title="아직 고르지 않은 사진만 남깁니다">태깅 안 한 것만</button>
     <button id="rebuildBtn" title="바뀐 내용으로 이 페이지와 LOG.md 를 다시 만듭니다">↻ 다시 빌드</button>
     <button id="organizeBtn" title="staging 폴더의 새 사진을 날짜·장소별로 정리합니다">📂 새 사진 정리</button>
     <button id="exportBtn" title="서버 없이 열었을 때 브라우저에 쌓인 수정본을 파일로 내려받습니다">⇩ 수정본 내보내기</button>
@@ -1569,6 +1789,23 @@ body.edit .shot.nosum{outline:2px dashed var(--warn);outline-offset:-2px}
         브라우저에만 쌓입니다. 그걸 <code>pending_edits.json</code> 으로 내려받는 버튼입니다.
         받은 파일을 <code>data/</code> 에 넣고 <code>jiho.py merge</code> 를 실행하면 반영됩니다.
         <b>서버로 열었다면 저장이 곧바로 파일에 들어가므로 쓸 일이 없습니다.</b></dd>
+    <dt>🎬 영상 태깅 / 태깅 안 한 것만</dt>
+    <dd>돌잔치 영상을 자동으로 만들 때 쓸 값을 사진마다 모읍니다. 아직 고르지 않은 사진을
+        차례로 열어주고, 진행 상황(<code>63/130</code>)을 알려줍니다.
+        <b>여기서는 누르는 즉시 저장됩니다</b> — 아래 요약·날짜·장소와 달리 [저장]이 없습니다.
+        <ul style="margin:8px 0 0;padding-left:18px">
+        <li><b>영상에 쓸까</b> — <code>1</code> 제외 / <code>2</code> 보통 / <code>3</code> 꼭.
+            같은 걸 다시 누르면 해제됩니다. 제외한 컷은 격자에서 흐리게 보입니다.</li>
+        <li><b>같이 나온 사람</b> — <code>A S D F …</code> 로 토글. "할머니와 지호"처럼
+            사람별 장면을 묶고, 모든 가족이 최소 한 번 나오게 하는 데 씁니다.
+            지호는 거의 모든 컷에 있으니 목록에 넣지 않았습니다.</li>
+        <li><b>영상 자막</b> — 화면에 띄울 짧은 문구(12~14자). [요약에서]를 누르면 초안이 들어갑니다.</li>
+        <li><b>얼굴 위치</b> — 사진에서 얼굴을 클릭해 점을 찍습니다(<code>C</code> 로 지움).
+            가로 사진을 세로 영상에 넣거나 확대·이동 효과를 줄 때 <b>얼굴이 잘리지 않게</b> 하는 기준점입니다.</li>
+        <li><b>🔒 비공개</b> — <code>P</code>. 목욕·병원 사진처럼 하객 앞에 띄우면 안 되는 컷.
+            <code>jiho.py bundle</code> 로 만드는 공유용 번들에서 썸네일까지 빠집니다.</li>
+        <li><code>N</code> 은 아직 안 고른 다음 사진, <code>←</code> <code>→</code> 는 이전·다음입니다.</li>
+        </ul></dd>
     <dt>사진 크게 보기 → ✎ 수정</dt>
     <dd>사진을 크게 열면 요약·촬영 일시·장소는 <b>읽기 전용</b>입니다.
         <b>✎ 수정</b>을 누르면(또는 그 칸을 그냥 눌러도) 입력칸이 열리고 <b>저장</b> 버튼이 나타납니다.
@@ -1593,6 +1830,31 @@ body.edit .shot.nosum{outline:2px dashed var(--warn);outline-offset:-2px}
   <div class="stage"></div>
   <aside>
     <h4 id="lbTitle"></h4><div class="sub" id="lbSub"></div>
+    <div class="tagbox">
+      <label>영상에 쓸까 <span class="keys">1 2 3</span></label>
+      <div class="seg" id="fPick">
+        <button data-v="0" class="no">✕ 제외</button>
+        <button data-v="1">· 보통</button>
+        <button data-v="2">★ 꼭</button>
+      </div>
+      <label>같이 나온 사람 <span class="keys">A S D F G H J K L</span></label>
+      <div class="chips" id="fPeople"></div>
+      <label>영상 자막 <span class="keys">12~14자</span></label>
+      <div class="short">
+        <input id="fShort" maxlength="40" placeholder="예: 백일, 처음 웃던 날">
+        <button id="shortFromSum" title="요약 앞부분을 가져옵니다">요약에서</button>
+      </div>
+      <label>얼굴 위치 <span class="keys">사진 클릭 · C 지우기</span></label>
+      <div class="seg" id="fFace">
+        <button data-v="s">작게</button><button data-v="m">보통</button><button data-v="l">크게</button>
+      </div>
+      <div class="hint" id="focusHint"></div>
+      <button class="linkbtn" id="clearFocusBtn" hidden>얼굴 위치 지우기</button>
+      <div class="row">
+        <button id="privBtn" title="공유 번들·상영 화면에서 뺍니다">🔒 비공개</button>
+        <button id="nextTagBtn" title="아직 고르지 않은 다음 사진으로">아직 안 고른 다음 →</button>
+      </div>
+    </div>
     <label>요약</label>
     <textarea id="fSum" rows="4" placeholder="이 순간을 한 줄로…" readonly></textarea>
     <label>촬영 일시</label>
@@ -1693,6 +1955,7 @@ function render(){
   }
   const t=stage.querySelector('.livetoggle');
   if(t) t.onclick=e=>{e.stopPropagation();liveOn=!liveOn;render();};
+  drawFocus();
 }
 // ── 읽기 전용 ↔ 수정 상태 ──────────────────────────────
 // 라이트박스는 열자마자 읽기 전용이다. [✎ 수정]을 눌러야 입력칸이 열리고
@@ -1745,6 +2008,7 @@ function show(i){
     ? `GPS ${d.geokey}${d.auto?` · 자동판정 "${d.auto}"`:''}`
     : 'GPS 정보 없음') + ` · 현재 출처: ${psrc}`;
   lb.classList.add('on');
+  renderTags();          // 사진 위 과녁을 그리려면 라이트박스가 보인 뒤여야 한다
 }
 async function close(){
   if(!await leaveGuard()) return;
@@ -1857,6 +2121,159 @@ $('#savePlaceBtn').onclick=async()=>{
        say(`좌표 ${d.geokey} 의 모든 사진 장소를 "${label}" 로 바꿨습니다`,'ok'); }
   catch(e){ say('실패: '+e.message,'err'); }
 };
+// ── 영상 태그 ──────────────────────────────────────────
+// 돌잔치 영상을 자동으로 만들려면 "쓸 컷인지 / 누가 나오는지 / 어디를 잘라야
+// 얼굴이 살아남는지"가 데이터에 있어야 한다. 130장을 빠르게 훑는 작업이라
+// 여기서는 누르는 즉시 저장한다 — 요약·날짜·장소의 [✎ 수정]과 다른 방식이다.
+const PKEYS='asdfghjkl';
+let roster={{ROSTER}};
+const esc=s=>String(s).replace(/[<>&"]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
+
+const tagOf=s=>({
+  pick:   s.dataset.pick===''?null:+s.dataset.pick,
+  priv:   s.dataset.priv==='1',
+  focus:  s.dataset.focus?s.dataset.focus.split(',').map(Number):null,
+  face:   s.dataset.face||'',
+  people: s.dataset.ppl?s.dataset.ppl.split(','):[],
+  short:  s.dataset.short||'',
+});
+function tagStats(){
+  let done=0,must=0,drop=0;
+  shots.forEach(s=>{const p=s.dataset.pick; if(p==='')return;
+                    done++; if(p==='2')must++; if(p==='0')drop++;});
+  return {done,must,drop,total:shots.length};
+}
+// 격자 쪽 표시(테두리·배지)를 데이터에 맞춘다
+function paintShot(s){
+  const t=tagOf(s);
+  s.classList.remove('pick0','pick1','pick2','untagged');
+  s.classList.add(t.pick===null?'untagged':'pick'+t.pick);
+  s.classList.toggle('priv',t.priv);
+  const marks=[t.pick===2?'★':t.pick===1?'·':t.pick===0?'✕':'', t.priv?'🔒':'',
+               t.focus?'◎':'', t.people.length?`<em>${t.people.length}</em>`:''].filter(Boolean).join('');
+  let el=s.querySelector('.tagmark');
+  if(!marks){ if(el) el.remove(); return; }
+  if(!el){ el=document.createElement('span'); el.className='tagmark';
+           s.insertBefore(el,s.querySelector('figcaption')); }
+  el.innerHTML=marks;
+}
+function applyTag(s,patch){
+  if('pick' in patch)    s.dataset.pick  = patch.pick===null?'':String(patch.pick);
+  if('private' in patch) s.dataset.priv  = patch.private?'1':'';
+  if('focus' in patch)   s.dataset.focus = patch.focus?patch.focus.map(v=>+v.toFixed(4)).join(','):'';
+  if('face' in patch)    s.dataset.face  = patch.face||'';
+  if('people' in patch)  s.dataset.ppl   = (patch.people||[]).join(',');
+  if('short' in patch)   s.dataset.short = patch.short||'';
+  paintShot(s);
+}
+async function saveTag(patch,msg){
+  const s=shots[cur];
+  try{
+    if(live) await api('/api/tag',{file:s.dataset.file,...patch});
+    else stash('__tag__'+s.dataset.file,patch);
+    applyTag(s,patch); renderTags();
+    if(msg!==false){ const t=tagStats();
+      say(`${msg||'저장'} · ${t.done}/${t.total} (꼭 ${t.must} · 제외 ${t.drop})`,'ok'); }
+  }catch(e){ say('태그 저장 실패: '+e.message,'err'); }
+}
+function renderTags(){
+  const t=tagOf(shots[cur]);
+  $('#fPick').querySelectorAll('button').forEach(b=>b.classList.toggle('on',+b.dataset.v===t.pick));
+  $('#fFace').querySelectorAll('button').forEach(b=>b.classList.toggle('on',b.dataset.v===t.face));
+  $('#privBtn').classList.toggle('on',t.priv);
+  $('#privBtn').textContent = t.priv?'🔒 비공개 — 영상에서 뺌':'🔒 비공개';
+  const box=$('#fPeople');
+  box.innerHTML = roster.map((n,i)=>
+      `<button data-n="${esc(n)}"${t.people.includes(n)?' class="on"':''}>${esc(n)}`
+      + (i<PKEYS.length?`<i>${PKEYS[i]}</i>`:'') + `</button>`).join('')
+    + `<button class="add" id="addPerson" title="목록에 사람을 추가합니다">+ 사람</button>`;
+  box.querySelectorAll('button[data-n]').forEach(b=>b.onclick=()=>togglePerson(b.dataset.n));
+  $('#addPerson').onclick=addPerson;
+  if(document.activeElement!==$('#fShort')) $('#fShort').value=t.short;
+  $('#focusHint').textContent = t.focus
+    ? `지정됨 — 가로 ${Math.round(t.focus[0]*100)}% · 세로 ${Math.round(t.focus[1]*100)}% (다시 클릭하면 옮깁니다)`
+    : '사진에서 지호 얼굴을 클릭해 두면, 세로/가로 영상으로 자를 때 얼굴이 잘리지 않습니다';
+  $('#clearFocusBtn').hidden=!t.focus;
+  drawFocus();
+}
+// 얼굴 위치 과녁을 사진 위 그 지점에 얹는다 (사진은 비율 유지라 매번 위치가 다르다)
+function drawFocus(){
+  const old=stage.querySelector('.focus'); if(old) old.remove();
+  const d=shots[cur].dataset, img=stage.querySelector('img');
+  if(!d.focus||!img) return;
+  const put=()=>{
+    if(!lb.classList.contains('on')||stage.querySelector('img')!==img) return;
+    const [x,y]=d.focus.split(',').map(Number);
+    const r=img.getBoundingClientRect(), sr=stage.getBoundingClientRect();
+    if(!r.width) return;
+    const m=document.createElement('div'); m.className='focus';
+    m.style.left=(r.left-sr.left+x*r.width)+'px';
+    m.style.top=(r.top-sr.top+y*r.height)+'px';
+    stage.appendChild(m);
+  };
+  if(img.complete) put(); else img.addEventListener('load',put,{once:true});
+}
+function togglePick(v){
+  const t=tagOf(shots[cur]);
+  saveTag({pick:t.pick===v?null:v}, t.pick===v?'선택 해제':{0:'✕ 제외',1:'· 보통',2:'★ 꼭'}[v]);
+}
+function togglePerson(n){
+  const t=tagOf(shots[cur]);
+  const people=t.people.includes(n)?t.people.filter(x=>x!==n):t.people.concat([n]);
+  saveTag({people}, people.length?`인물: ${people.join(', ')}`:'인물 없음');
+}
+async function addPerson(){
+  const n=(prompt('추가할 사람 이름 (예: 고모)')||'').trim();
+  if(!n) return;
+  if(!roster.includes(n)){
+    roster=roster.concat([n]);
+    try{ if(live) await api('/api/note',{roster}); else stash('__roster__',{roster}); }
+    catch(e){ say('사람 목록 저장 실패: '+e.message,'err'); }
+  }
+  togglePerson(n);
+}
+// 요약에서 자막 초안: '긴 설명 — 짧은 말' 중 짧은 쪽을 쓴다.
+// 길면 단어 경계에서 자르되, 조금 넘는 정도는 그대로 둔다(말이 잘리는 게 더 나쁘다).
+function shortFrom(cap){
+  const parts=cap.split(/\s*[—–]\s*/).map(x=>x.trim()).filter(Boolean);
+  let t=(parts.sort((a,b)=>a.length-b.length)[0]||cap).trim();
+  if(t.length>18){ const cut=t.slice(0,18), sp=cut.lastIndexOf(' ');
+                   t=(sp>8?cut.slice(0,sp):cut).trim(); }
+  return t;
+}
+async function nextUntagged(){
+  const i=shots.findIndex((s,k)=>k>cur&&s.dataset.pick==='');
+  const j=i>=0?i:shots.findIndex(s=>s.dataset.pick==='');
+  if(j<0) return say('모든 사진을 다 골랐습니다 🎉','ok');
+  await go(j);
+}
+$('#fPick').querySelectorAll('button').forEach(b=>b.onclick=()=>togglePick(+b.dataset.v));
+$('#fFace').querySelectorAll('button').forEach(b=>b.onclick=()=>{
+  const now=tagOf(shots[cur]).face;
+  saveTag({face:now===b.dataset.v?'':b.dataset.v}, now===b.dataset.v?'얼굴 크기 해제':'얼굴 크기');
+});
+$('#privBtn').onclick=()=>{const t=tagOf(shots[cur]);
+  saveTag({private:!t.priv}, t.priv?'비공개 해제':'🔒 비공개 — 공유·영상에서 뺍니다');};
+$('#nextTagBtn').onclick=nextUntagged;
+$('#clearFocusBtn').onclick=()=>saveTag({focus:null},'얼굴 위치 지움');
+$('#shortFromSum').onclick=()=>{
+  const cap=shots[cur].dataset.cap||'';
+  if(!cap) return say('요약이 비어 있어 가져올 것이 없습니다','err');
+  $('#fShort').value=shortFrom(cap); $('#fShort').focus();
+};
+$('#fShort').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();e.target.blur();}});
+$('#fShort').addEventListener('blur',()=>{
+  const v=$('#fShort').value.trim();
+  if(v!==(shots[cur].dataset.short||'')) saveTag({short:v},'자막');
+});
+// 사진을 클릭하면 그 지점이 얼굴 위치가 된다 (영상은 해당 없음)
+stage.addEventListener('click',e=>{
+  const img=e.target.closest('img'); if(!img) return;
+  const r=img.getBoundingClientRect();
+  saveTag({focus:[Math.min(1,Math.max(0,(e.clientX-r.left)/r.width)),
+                  Math.min(1,Math.max(0,(e.clientY-r.top)/r.height))]}, '얼굴 위치 지정');
+});
+
 shots.forEach((s,i)=>s.addEventListener('click',e=>{
   // 편집 모드에서 캡션을 누른 경우엔 라이트박스를 열지 않는다
   if(document.body.classList.contains('edit') && e.target.closest('figcaption')) return;
@@ -1907,7 +2324,17 @@ document.addEventListener('keydown',e=>{
   if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();
     if(lb.classList.contains('editing')) save(); else $('#editFieldsBtn').click();}
   if(typing)return;
-  if(e.key==='ArrowLeft')go(cur-1); if(e.key==='ArrowRight')go(cur+1);
+  if(e.key==='ArrowLeft'){go(cur-1);return;} if(e.key==='ArrowRight'){go(cur+1);return;}
+  // 영상 태그 단축키 — 130장을 훑는 작업이라 손이 키보드를 떠나지 않게
+  if(e.metaKey||e.ctrlKey||e.altKey)return;
+  const k=e.key.toLowerCase();
+  if(k==='1'||k==='2'||k==='3'){e.preventDefault();togglePick(+k-1);return;}
+  if(k==='x'){togglePick(0);return;}
+  if(k==='p'){saveTag({private:!tagOf(shots[cur]).priv},'비공개 전환');return;}
+  if(k==='c'){saveTag({focus:null},'얼굴 위치 지움');return;}
+  if(k==='n'){nextUntagged();return;}
+  const pi=PKEYS.indexOf(k);
+  if(pi>=0&&pi<roster.length)togglePerson(roster[pi]);
 });
 // 저장 안 한 채로 창을 닫거나 새로고침하면 브라우저가 한 번 더 묻는다
 window.addEventListener('beforeunload',e=>{ if(isDirty()){e.preventDefault();e.returnValue='';} });
@@ -1943,6 +2370,19 @@ $('#nextBtn').onclick=async()=>{
   if(!await leaveGuard())return;
   document.body.classList.add('edit'); $('#editBtn').classList.add('on');
   show(j); setEditing(true); setTimeout(()=>$('#fSum').focus(),60);
+};
+$('#tagBtn').onclick=()=>{
+  const t=tagStats();
+  say(`영상 태깅 ${t.done}/${t.total} — 꼭 ${t.must} · 제외 ${t.drop} · 남은 ${t.total-t.done}`,'ok');
+  nextUntagged();
+};
+$('#untaggedBtn').onclick=e=>{
+  const on=document.body.classList.toggle('onlyuntagged');
+  e.target.classList.toggle('on',on);
+  document.querySelectorAll('.day').forEach(d=>
+    d.classList.toggle('hide', on && !d.querySelector('.shot.untagged')));
+  const t=tagStats();
+  say(on?`아직 안 고른 ${t.total-t.done}장만 보입니다`:'전체 보기','ok');
 };
 $('#rebuildBtn').onclick=async()=>{ say('다시 빌드 중…');
   try{ await api('/api/rebuild',{}); location.reload(); }catch(e){ say('실패: '+e.message,'err'); } };

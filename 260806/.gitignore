@@ -9,7 +9,7 @@ dist/
 data/meta.json
 data/move_manifest.jsonl
 
-# 손으로 쓴 요약·메모·장소·생일(data/*.json)과 갤러리(index.html, LOG.md,
+# 손으로 쓴 요약·메모·장소·생일·영상 태그(data/*.json)와 갤러리(index.html, LOG.md,
 # gallery/thumbs 5.6MB)는 일부러 추적한다. 원본 없이도 페이지가 보이도록.
 
 .DS_Store
