@@ -63,6 +63,9 @@ OVERRIDES_JSON = DATA / "overrides.json"      # 파일별 날짜/장소 수정
 DAY_PLACES_JSON = DATA / "day_places.json"    # 날짜별 장소 일괄 지정 (GPS 없는 사진용)
 NOTES_JSON = DATA / "notes.json"              # 생일·제목·날짜별 메모
 EDITS_JSON = DATA / "edits.json"              # 영상 제작용 태그 (선별·인물·얼굴 위치…)
+CHAPTERS_JSON = DATA / "chapters.json"        # 영상 챕터 (제목·기간·목표 길이)
+MUSIC_JSON = DATA / "music.json"              # 배경음악 BPM·첫 박·후렴 구간
+PLAN_JSON = DATA / "video_plan.json"          # 계산된 컷 리스트 (자동 생성)
 MANIFEST = DATA / "move_manifest.jsonl"       # organize 이동 기록 (undo 용)
 
 TZ_OFFSET = 9.0          # Asia/Seoul
@@ -81,6 +84,17 @@ SHORT_MAX = 40           # 화면 자막용 짧은 문구 길이 상한
 # 나왔나"를 모으는 것이 목적). notes.json 의 "roster" 로 바꿀 수 있다.
 DEFAULT_ROSTER = ["엄마", "아빠", "할머니", "할아버지",
                   "외할머니", "외할아버지", "이모", "삼촌", "친구"]
+# 마일스톤 — 챕터 뼈대와 "처음으로…" 자막 카드의 재료
+DEFAULT_MILESTONES = ["백일", "200일", "돌", "첫 뒤집기", "첫 이유식",
+                      "첫 니", "첫 걸음", "첫 옹알이", "여행", "명절"]
+
+# ---- 영상 계획 --------------------------------------------------------
+DEFAULT_TARGET_SEC = 300         # 영상 전체 목표 길이 (5분)
+BEATS = {2: 4, 1: 2}             # 꼭 = 4박, 보통 = 2박 동안 머문다
+BEATS_CHORUS = {2: 2, 1: 1}      # 후렴에서는 절반으로 — 빠르게 몰아친다
+FALLBACK_SEC = {2: 3.0, 1: 1.8}  # BPM 을 모를 때 쓰는 초 단위 길이
+CLIP_MAX_SEC = 6.0               # in/out 을 안 잡은 영상에서 기본으로 쓸 길이
+MOODS = ["잔잔하게", "밝게", "신나게", "뭉클하게"]
 
 
 # --------------------------------------------------------------------- 공통
@@ -453,7 +467,11 @@ def cmd_merge(args):
         elif key.startswith("__tag__"):
             _save_tag({"file": key[len("__tag__"):], **patch})
         elif key.startswith("__roster__"):
-            _save_note({"roster": patch.get("roster", [])})
+            _save_note({k: v for k, v in patch.items() if k in ("roster", "milestones")})
+        elif key.startswith("__chapters__"):
+            _save_chapters(patch)
+        elif key.startswith("__music__"):
+            _save_music(patch)
         else:
             _save_item({"file": key, **patch})
         n += 1
@@ -784,7 +802,7 @@ def _shot_html(m, summaries, size, out=None, lite=False, keep=None, edits=None):
     }
     # 영상 태그 — 갤러리에서 눌러 모으고, 다시 열었을 때 그대로 보이게 심어둔다
     e = (edits or {}).get(m["file"], {})
-    pick, foc = e.get("pick"), e.get("focus")
+    pick, foc, clip = e.get("pick"), e.get("focus"), e.get("clip")
     data.update({
         "pick": "" if pick is None else str(pick),
         "priv": "1" if e.get("private") else "",
@@ -792,6 +810,10 @@ def _shot_html(m, summaries, size, out=None, lite=False, keep=None, edits=None):
         "face": e.get("face") or "",
         "ppl": ",".join(e.get("people") or []),
         "short": e.get("short") or "",
+        "tg": ",".join(e.get("tags") or []),
+        "clip": f"{clip[0]},{clip[1]}" if clip else "",
+        "audio": e.get("audio") or "",
+        "dur": m.get("duration_sec") or "",
     })
     attrs = " ".join(f'data-{k}="{html.escape(str(v), quote=True)}"' for k, v in data.items())
     return (f'<figure class="shot {shot_shape(m)}{" vid" if vid else ""}'
@@ -812,6 +834,8 @@ def _tagmark_html(e) -> str:
         {2: "★", 1: "·", 0: "✕"}.get(e.get("pick"), ""),
         "🔒" if e.get("private") else "",
         "◎" if e.get("focus") else "",
+        "✂" if e.get("clip") else "",
+        "🔊" if e.get("audio") == "keep" else "",
         f"<em>{len(e['people'])}</em>" if e.get("people") else "",
     ]))
     return f'<span class="tagmark">{marks}</span>' if marks else ""
@@ -964,7 +988,14 @@ def _write_gallery(days, review, summaries, notes, bday, size, out=None, lite=Fa
         .replace("{{VECS}}", json.dumps(vecs, ensure_ascii=False, separators=(",", ":")))
         .replace("{{IDF}}", json.dumps(idf, ensure_ascii=False, separators=(",", ":")))
         .replace("{{ROSTER}}", json.dumps(roster_of(notes), ensure_ascii=False,
-                                          separators=(",", ":"))),
+                                          separators=(",", ":")))
+        .replace("{{MILESTONES}}", json.dumps(milestones_of(notes), ensure_ascii=False,
+                                              separators=(",", ":")))
+        .replace("{{CHAPTERS}}", json.dumps(load_chapters(), ensure_ascii=False,
+                                            separators=(",", ":")))
+        .replace("{{MUSIC}}", json.dumps(load_music(), ensure_ascii=False,
+                                         separators=(",", ":")))
+        .replace("{{MOODS}}", json.dumps(MOODS, ensure_ascii=False, separators=(",", ":"))),
         encoding="utf-8")
 
 
@@ -1046,6 +1077,22 @@ class _Handler(SimpleHTTPRequestHandler):
                 # 태그는 연달아 눌러 들어오므로 조금 더 모았다가 다시 만든다
                 self._json(_save_tag(payload))
                 schedule_rebuild(delay=5.0)
+            elif self.path == "/api/chapters":
+                if payload.get("draft"):     # 저장하지 않고 초안만 만들어 돌려준다
+                    meta = load_json(META_JSON, {"items": []})
+                    notes = load_json(NOTES_JSON, {})
+                    self._json({"ok": True, "chapters": _draft_chapters(
+                        apply_overrides(meta["items"]), notes,
+                        int(payload.get("target_sec") or DEFAULT_TARGET_SEC),
+                        int(payload.get("count") or 6))})
+                else:
+                    self._json(_save_chapters(payload))
+            elif self.path == "/api/music":
+                self._json(_save_music(payload))
+            elif self.path == "/api/plan":
+                cmd_plan(argparse.Namespace(with_untagged=bool(payload.get("with_untagged")),
+                                            stretch=True))
+                self._json({"ok": True, "plan": load_json(PLAN_JSON, {})})
             elif self.path == "/api/rebuild":
                 cmd_build(argparse.Namespace(size=payload.get("size", 480)))
                 self._json({"ok": True})
@@ -1136,14 +1183,16 @@ def _save_note(p):
     for key in ("title", "birthday"):
         if key in p:
             notes[key] = p[key]
-    if "roster" in p:                    # 인물 태그 목록 (갤러리에서 사람 추가)
-        seen, roster = set(), []
-        for name in p["roster"] or []:
+    for key in ("roster", "milestones"):   # 인물 / 마일스톤 목록 (갤러리에서 추가)
+        if key not in p:
+            continue
+        seen, names = set(), []
+        for name in p[key] or []:
             name = str(name).strip()
             if name and name not in seen:
                 seen.add(name)
-                roster.append(name)
-        notes["roster"] = roster
+                names.append(name)
+        notes[key] = names
     save_json(NOTES_JSON, notes)
     return {"ok": True}
 
@@ -1157,6 +1206,11 @@ def load_edits() -> dict:
 def roster_of(notes) -> list[str]:
     r = [str(x).strip() for x in (notes.get("roster") or []) if str(x).strip()]
     return r or list(DEFAULT_ROSTER)
+
+
+def milestones_of(notes) -> list[str]:
+    r = [str(x).strip() for x in (notes.get("milestones") or []) if str(x).strip()]
+    return r or list(DEFAULT_MILESTONES)
 
 
 def _clean_tag(entry: dict, p: dict) -> dict:
@@ -1202,6 +1256,30 @@ def _clean_tag(entry: dict, p: dict) -> dict:
             entry["short"] = text
         else:
             entry.pop("short", None)
+    if "tags" in p:                       # 마일스톤 (첫 걸음·백일·여행…)
+        seen, tags = set(), []
+        for t in p["tags"] or []:
+            t = str(t).strip()
+            if t and t not in seen:
+                seen.add(t)
+                tags.append(t)
+        if tags:
+            entry["tags"] = tags
+        else:
+            entry.pop("tags", None)
+    if "clip" in p:                       # 영상에서 쓸 구간 [시작초, 끝초]
+        c = p["clip"]
+        if not c:
+            entry.pop("clip", None)
+        else:
+            a, b = (round(max(0.0, float(v)), 2) for v in (c[0], c[1]))
+            if b <= a:
+                raise ValueError(f"영상 구간의 끝이 시작보다 빠릅니다 ({a}초 → {b}초)")
+            entry["clip"] = [a, b]
+    if "audio" in p:                      # 아기 웃음소리처럼 살려야 하는 소리
+        entry["audio"] = "keep" if p["audio"] == "keep" else "mute"
+        if entry["audio"] == "mute":
+            entry.pop("audio", None)      # 음소거가 기본 — 굳이 저장하지 않는다
     return entry
 
 
@@ -1214,13 +1292,72 @@ def _save_tag(p):
     try:
         entry = _clean_tag(dict(edits.get(name, {})), p)
     except (TypeError, ValueError, IndexError) as e:
-        return {"ok": False, "error": f"값을 읽지 못했습니다: {e}"}
+        return {"ok": False, "error": f"값을 저장하지 못했습니다 — {e}"}
     if entry:
         edits[name] = entry
     else:
         edits.pop(name, None)
     save_json(EDITS_JSON, edits)
     return {"ok": True, "tag": entry}
+
+
+# ------------------------------------------------------------ 챕터 · 음악
+
+def load_chapters() -> dict:
+    c = load_json(CHAPTERS_JSON, {})
+    return {"target_sec": int(c.get("target_sec") or DEFAULT_TARGET_SEC),
+            "chapters": [x for x in c.get("chapters", []) if isinstance(x, dict)]}
+
+
+def load_music() -> dict:
+    m = load_json(MUSIC_JSON, {})
+    return {"file": m.get("file") or "", "bpm": float(m.get("bpm") or 0),
+            "offset": float(m.get("offset") or 0),
+            "sections": [x for x in m.get("sections", []) if isinstance(x, dict)]}
+
+
+def _save_chapters(p):
+    """영상 챕터 목록 저장 — 제목/기간/목표 길이가 영상의 뼈대가 된다."""
+    out = []
+    for c in p.get("chapters") or []:
+        title = str(c.get("title") or "").strip()
+        frm, to = norm_datetime(c.get("from") or ""), norm_datetime(c.get("to") or "")
+        if not title or not frm or not to:
+            return {"ok": False, "error": f"챕터 '{title or '(제목 없음)'}' 의 제목·기간을 확인해주세요"}
+        frm, to = frm[:10], to[:10]
+        if to < frm:
+            return {"ok": False, "error": f"'{title}' 의 기간이 거꾸로입니다 ({frm} → {to})"}
+        out.append({"title": title, "from": frm, "to": to,
+                    "sec": max(1, int(c.get("sec") or 30)),
+                    "mood": str(c.get("mood") or "").strip(),
+                    "note": str(c.get("note") or "").strip()})
+    out.sort(key=lambda c: c["from"])
+    data = {"target_sec": max(10, int(p.get("target_sec") or DEFAULT_TARGET_SEC)),
+            "chapters": out}
+    save_json(CHAPTERS_JSON, data)
+    return {"ok": True, "chapters": len(out)}
+
+
+def _save_music(p):
+    """배경음악의 BPM·첫 박 위치·후렴 구간. 컷을 박자에 맞추는 데 쓴다."""
+    secs = []
+    for s in p.get("sections") or []:
+        try:
+            a, b = round(float(s.get("from")), 2), round(float(s.get("to")), 2)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "후렴 구간은 '48-80' 처럼 초 단위로 적어주세요"}
+        if b > a:
+            secs.append({"name": str(s.get("name") or "chorus").strip() or "chorus",
+                         "from": a, "to": b})
+    try:
+        data = {"file": str(p.get("file") or "").strip(),
+                "bpm": round(max(0.0, float(p.get("bpm") or 0)), 2),
+                "offset": round(max(0.0, float(p.get("offset") or 0)), 3),
+                "sections": sorted(secs, key=lambda s: s["from"])}
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "BPM·오프셋은 숫자로 적어주세요"}
+    save_json(MUSIC_JSON, data)
+    return {"ok": True}
 
 
 def cmd_bundle(args):
@@ -1285,6 +1422,312 @@ def cmd_bundle(args):
         print(f"  · 비공개 {len(hidden)}장 " + ("포함됨 (--with-private)" if args.with_private
                                               else "제외 — 썸네일까지 뺐습니다"))
     print(f"  · 확인: open {dist.relative_to(ROOT)}/index.html")
+
+
+# ------------------------------------------------------------------- 영상 계획
+
+def _draft_chapters(items, notes, target_sec=DEFAULT_TARGET_SEC, n=6) -> list[dict]:
+    """사진이 몰려 있는 정도에 맞춰 챕터 초안을 만든다.
+
+    재료가 비슷하게 들어가도록 '날짜'가 아니라 '컷 수'로 균등 분할하고,
+    그 구간에 적어둔 메모가 있으면 제목으로 쓴다.
+    """
+    from collections import Counter
+    counts = Counter((m.get("taken_local") or "")[:10] for m in items if m.get("taken_local"))
+    counts.pop("", None)
+    days = sorted(counts)
+    if not days:
+        return []
+    bday = birthday(notes)
+    total = sum(counts.values())
+    per = total / max(1, min(n, len(days)))
+
+    groups, cur, acc = [], [], 0
+    for d in days:
+        cur.append(d)
+        acc += counts[d]
+        if acc >= per and len(groups) < n - 1:
+            groups.append(cur)
+            cur, acc = [], 0
+    if cur:
+        groups.append(cur)
+
+    out = []
+    for i, g in enumerate(groups):
+        memo = next((notes.get("days", {}).get(d) for d in g if notes.get("days", {}).get(d)), None)
+        if memo:                       # '긴 설명 — 짧은 말' 이면 짧은 쪽을 제목으로
+            memo = min(re.split(r"\s*[—–]\s*", memo), key=len).strip() or memo
+        age = age_label(g[len(g) // 2], bday) or ""
+        age = age.split("·")[-1].strip() if "·" in age else age
+        cuts = sum(counts[d] for d in g)
+        out.append({"title": memo or (f"{age} 무렵" if age else f"{i + 1}부"),
+                    "from": g[0], "to": g[-1],
+                    "sec": max(10, round(target_sec * cuts / total)),
+                    "mood": MOODS[i % len(MOODS)], "note": ""})
+    return out
+
+
+def cmd_chapters(args):
+    meta = load_json(META_JSON, {"items": []})
+    items = apply_overrides(meta["items"])
+    notes = load_json(NOTES_JSON, {})
+    conf = load_chapters()
+    if args.init or not conf["chapters"]:
+        draft = _draft_chapters(items, notes, args.target or conf["target_sec"], args.count)
+        if not args.init:
+            print("chapters: data/chapters.json 이 아직 없습니다 — 아래는 초안입니다")
+        else:
+            _save_chapters({"target_sec": args.target or conf["target_sec"], "chapters": draft})
+            print(f"chapters: 초안 {len(draft)}개를 {CHAPTERS_JSON.relative_to(ROOT)} 에 저장했습니다")
+        conf = {"target_sec": args.target or conf["target_sec"], "chapters": draft}
+    total = sum(c["sec"] for c in conf["chapters"])
+    print(f"  목표 {conf['target_sec']}초 / 챕터 합계 {total}초")
+    for c in conf["chapters"]:
+        print(f"  · {c['from']} ~ {c['to']}  {c['sec']:>3}초  {c['mood'] or '-':<6} {c['title']}")
+    if not args.init:
+        print("  · 갤러리 [🎞 챕터·음악] 에서 고치거나 `jiho.py chapters --init` 로 저장하세요")
+
+
+def cmd_music(args):
+    m = load_music()
+    if args.file is not None:
+        m["file"] = args.file
+    if args.bpm is not None:
+        m["bpm"] = args.bpm
+    if args.offset is not None:
+        m["offset"] = args.offset
+    if args.chorus is not None:
+        m["sections"] = [{"name": "chorus", "from": a, "to": b}
+                         for a, b in _parse_ranges(args.chorus)]
+    r = _save_music(m)
+    if not r["ok"]:
+        sys.exit("music: " + r["error"])
+    beat = 60.0 / m["bpm"] if m["bpm"] else 0
+    print(f"music: {m['file'] or '(파일 미지정)'}  BPM {m['bpm'] or '-'}  첫 박 {m['offset']}초")
+    if beat:
+        print(f"  · 1박 {beat:.3f}초 — 꼭 {BEATS[2]}박({BEATS[2] * beat:.1f}초) / "
+              f"보통 {BEATS[1]}박({BEATS[1] * beat:.1f}초)")
+    else:
+        print(f"  · BPM 을 넣으면 컷이 박자에 맞습니다. 지금은 {FALLBACK_SEC[2]}/{FALLBACK_SEC[1]}초 고정")
+    for s in m["sections"]:
+        print(f"  · {s['name']} {s['from']}~{s['to']}초 — 이 구간은 컷을 절반 길이로 몰아칩니다")
+
+
+def _parse_ranges(text: str) -> list[tuple[float, float]]:
+    """'48-80, 140-172' → [(48,80),(140,172)]"""
+    out = []
+    for part in re.split(r"[,;]", text or ""):
+        m = re.match(r"\s*([\d.]+)\s*[-~]\s*([\d.]+)\s*$", part)
+        if m:
+            a, b = float(m.group(1)), float(m.group(2))
+            if b > a:
+                out.append((a, b))
+    return out
+
+
+def _in_chorus(t: float, music) -> bool:
+    return any(s["from"] <= t < s["to"] for s in music["sections"])
+
+
+def _clip_seconds(m, e) -> float:
+    """영상에서 실제로 재생할 길이 — 구간을 안 잡았으면 앞부분을 조금만."""
+    clip = e.get("clip")
+    if clip:
+        return round(clip[1] - clip[0], 2)
+    return round(min(CLIP_MAX_SEC, m.get("duration_sec") or CLIP_MAX_SEC), 2)
+
+
+def _cut_seconds(m, e, pick, beat, chorus, stretch=1.0) -> float:
+    """이 컷이 화면에 머무는 시간.
+
+    사진은 박자에 맞춰 머물고(후렴에서는 절반), 영상은 잡아둔 구간 길이를 그대로
+    쓰되 다음 컷이 박에서 밀리지 않도록 박 단위로 올림한다.
+    """
+    if m["kind"] == "video":
+        dur = _clip_seconds(m, e)
+        return round(math.ceil(dur / beat) * beat, 3) if beat else round(dur, 2)
+    n = (BEATS_CHORUS if chorus else BEATS)[pick]
+    if beat:
+        return round(max(1, round(n * stretch)) * beat, 3)
+    return round(FALLBACK_SEC[pick] * (0.5 if chorus else 1.0) * stretch, 3)
+
+
+def _layout(keep, t0, beat, music, stretch=1.0):
+    """컷들을 시간축에 늘어놓는다. 후렴에 걸리는지는 그 컷의 시작 시각으로 정한다."""
+    t, durs = t0, []
+    for m, e, pick, _ in keep:
+        dur = _cut_seconds(m, e, pick, beat, _in_chorus(t - music["offset"], music), stretch)
+        durs.append(dur)
+        t = round(t + dur, 3)
+    return durs, round(t - t0, 3)
+
+
+def cmd_plan(args):
+    """태그 + 챕터 + 음악을 합쳐 '몇 번째 컷을 몇 초씩' 까지 계산한다."""
+    meta = load_json(META_JSON, {"items": []})
+    items = apply_overrides(meta["items"])
+    summaries = load_json(SUMMARY_JSON, {})
+    notes = load_json(NOTES_JSON, {})
+    edits = load_edits()
+    bday = birthday(notes)
+    conf, music = load_chapters(), load_music()
+    beat = 60.0 / music["bpm"] if music["bpm"] else 0
+
+    chapters = conf["chapters"]
+    warn = []
+    if not chapters:
+        chapters = _draft_chapters(items, notes, conf["target_sec"])
+        warn.append("chapters.json 이 없어 초안으로 계산했습니다 — [🎞 챕터·음악] 에서 정해주세요")
+    if not beat:
+        warn.append("음악 BPM 이 없어 컷 길이를 고정값으로 잡았습니다 — `jiho.py music --bpm 92`")
+
+    # 후보 컷: 비공개·제외 빼고, 태그를 안 한 것은 --with-untagged 일 때만
+    cand, untagged = [], 0
+    for m in items:
+        e = edits.get(m["file"], {})
+        day = (m.get("taken_local") or "")[:10]
+        if not day or e.get("private") or e.get("pick") == 0:
+            continue
+        if e.get("pick") is None:
+            untagged += 1
+            if not args.with_untagged:
+                continue
+        cand.append((m, e, e.get("pick") if e.get("pick") is not None else 1, day))
+    if untagged and not args.with_untagged:
+        warn.append(f"아직 안 고른 사진 {untagged}장은 뺐습니다 — 갤러리 [🎬 영상 태깅] "
+                    f"(전부 넣으려면 --with-untagged)")
+
+    used = set()
+    out_chapters, t = [], 0.0
+    for ch in chapters:
+        group = sorted([x for x in cand if ch["from"] <= x[3] <= ch["to"]],
+                       key=lambda x: x[0]["taken_local"])
+        for x in group:
+            used.add(x[0]["file"])
+        budget, cstart = float(ch["sec"]), t
+        # 예산을 넘으면 '우선순위가 낮고 시간상 가장 붙어 있는' 컷부터 뺀다
+        keep, dropped_must = list(group), 0
+        while len(keep) > 1 and _layout(keep, cstart, beat, music)[1] > budget:
+            gone = keep.pop(_most_redundant(keep))
+            dropped_must += 1 if gone[2] == 2 else 0
+        if dropped_must:
+            warn.append(f"'{ch['title']}' 에서 ★ 꼭 골라둔 컷 {dropped_must}개가 "
+                        f"시간이 모자라 빠졌습니다 — 목표 길이를 늘려주세요")
+        # 남는 시간이 있으면 컷을 조금씩 늘려 메운다 (최대 1.8배)
+        durs, total = _layout(keep, cstart, beat, music)
+        if args.stretch and total and total < budget:
+            # 박자에 맞추느라 길이가 '몇 박' 단위로만 늘어난다 —
+            # 예산을 넘지 않는 선에서 가장 크게 늘어나는 배율을 고른다
+            for s in (1.8, 1.6, 1.5, 1.4, 1.3, 1.25, 1.2, 1.1):
+                if s * total > budget * 1.05:
+                    continue
+                d2, t2 = _layout(keep, cstart, beat, music, s)
+                if t2 <= budget * 1.05 and t2 > total:
+                    durs, total = d2, t2
+                    break
+
+        cuts = []
+        for (m, e, pick, day), dur in zip(keep, durs):
+            cap = e.get("short") or summaries.get(m["file"], "")
+            if not cap:
+                warn.append(f"자막 없음: {m['file']}")
+            if pick == 2 and m["kind"] == "image" and not e.get("focus"):
+                warn.append(f"얼굴 위치 없음(★ 꼭): {m['file']}")
+            src = _clip_seconds(m, e) if m["kind"] == "video" else None
+            if m["kind"] == "video" and not e.get("clip"):
+                warn.append(f"영상 구간 안 잡음: {m['file']} — 앞 {src:.1f}초를 그냥 씁니다"
+                            f" (전체 {m.get('duration_sec')}초)")
+            cuts.append({
+                "at": round(t, 3), "dur": dur, "file": m["file"], "path": m["path"],
+                "kind": m["kind"], "motion": m.get("motion") or "",
+                "day": day, "age": age_label(day, bday) or "",
+                "caption": cap, "pick": pick,
+                "focus": e.get("focus"), "face": e.get("face") or "",
+                "people": e.get("people") or [], "tags": e.get("tags") or [],
+                "clip": e.get("clip"), "src_dur": src, "audio": e.get("audio") or "mute",
+                "place": m.get("place") or "", "beat_aligned": bool(beat) and m["kind"] == "image",
+            })
+            t = round(t + dur, 3)
+        out_chapters.append({"title": ch["title"], "from": ch["from"], "to": ch["to"],
+                             "mood": ch.get("mood", ""), "target_sec": ch["sec"],
+                             "start_sec": round(cstart, 3), "dur_sec": round(t - cstart, 3),
+                             "cuts": cuts, "dropped": len(group) - len(keep)})
+
+    if t < conf["target_sec"] * 0.9:
+        warn.append(f"목표 {conf['target_sec']}초보다 {round(conf['target_sec'] - t)}초 짧습니다 — "
+                    f"챕터 길이를 줄이거나 컷을 더 골라주세요")
+    orphan = [x[0]["file"] for x in cand if x[0]["file"] not in used]
+    if orphan:
+        warn.append(f"어느 챕터에도 안 들어간 컷 {len(orphan)}개 — 챕터 기간을 넓혀주세요")
+    seen_people = {p for c in out_chapters for cut in c["cuts"] for p in cut["people"]}
+    missing = [p for p in roster_of(notes) if p not in seen_people]
+    if missing and seen_people:      # 인물 태그를 아예 안 했으면 굳이 알리지 않는다
+        warn.append("한 번도 안 나온 사람: " + ", ".join(missing))
+
+    plan = {"generated": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "title": notes.get("title", ""), "event": notes.get("event_name", ""),
+            "target_sec": conf["target_sec"], "total_sec": round(t, 3),
+            "cuts": sum(len(c["cuts"]) for c in out_chapters),
+            "music": music, "beat_sec": round(beat, 4) if beat else 0,
+            "chapters": out_chapters, "warnings": warn}
+    save_json(PLAN_JSON, plan)
+    _write_plan_md(plan)
+
+    mm, ss = divmod(int(plan["total_sec"]), 60)
+    print(f"plan: {plan['cuts']}컷 / {mm}분 {ss}초  (목표 {conf['target_sec']}초)")
+    for c in out_chapters:
+        print(f"  · {c['dur_sec']:>6.1f}초 {len(c['cuts']):>3}컷  {c['title']}"
+              + (f"  [{c['dropped']}컷 뺌]" if c["dropped"] else ""))
+    if warn:
+        head = warn[:6]
+        print(f"  ! 확인할 것 {len(warn)}건")
+        for w in head:
+            print(f"    - {w}")
+        if len(warn) > len(head):
+            print(f"    … 나머지 {len(warn) - len(head)}건은 VIDEO_PLAN.md 에 있습니다")
+    print(f"  · {PLAN_JSON.relative_to(ROOT)} · VIDEO_PLAN.md")
+
+
+def _most_redundant(keep) -> int:
+    """뺄 컷 고르기 — 우선순위가 낮고, 앞뒤 컷과 시간상 가장 붙어 있는 것."""
+    def ts(x):
+        try:
+            return dt.datetime.strptime(x[0]["taken_local"], "%Y-%m-%d %H:%M:%S").timestamp()
+        except (ValueError, TypeError):
+            return 0.0
+
+    worst, worst_key = 0, None
+    for i, x in enumerate(keep):
+        gaps = [abs(ts(x) - ts(keep[j])) for j in (i - 1, i + 1) if 0 <= j < len(keep)]
+        key = (x[2], min(gaps) if gaps else 0.0)
+        if worst_key is None or key < worst_key:
+            worst, worst_key = i, key
+    return worst
+
+
+def _write_plan_md(plan):
+    L = [f"# {plan['title']} — {plan['event'] or '영상'} 계획", "",
+         f"- 총 {plan['cuts']}컷 / {int(plan['total_sec']) // 60}분 "
+         f"{int(plan['total_sec']) % 60}초 (목표 {plan['target_sec']}초)",
+         f"- 음악: {plan['music']['file'] or '(미지정)'}"
+         + (f" · BPM {plan['music']['bpm']} · 1박 {plan['beat_sec']}초" if plan["beat_sec"]
+            else " · BPM 미지정"),
+         f"- 생성: {plan['generated']}", ""]
+    for c in plan["chapters"]:
+        mm, ss = divmod(int(c["start_sec"]), 60)
+        L += [f"## {c['title']}  ({mm}:{ss:02d} ~ · {c['dur_sec']:.1f}초 · {len(c['cuts'])}컷)",
+              f"> {c['from']} ~ {c['to']}" + (f" · {c['mood']}" if c["mood"] else ""), "",
+              "| 시각 | 길이 | 자막 | 파일 |", "|---|---|---|---|"]
+        for cut in c["cuts"]:
+            m2, s2 = divmod(int(cut["at"]), 60)
+            mark = "★" if cut["pick"] == 2 else ""
+            kind = "🎬" if cut["kind"] == "video" else ""
+            L.append(f"| {m2}:{s2:02d} | {cut['dur']:.1f}s | {mark}{kind} "
+                     f"{cut['caption'] or '_(없음)_'} | `{cut['file']}` |")
+        L.append("")
+    if plan["warnings"]:
+        L += ["## ⚠︎ 확인할 것", ""] + [f"- {w}" for w in plan["warnings"]] + [""]
+    (ROOT / "VIDEO_PLAN.md").write_text("\n".join(L), encoding="utf-8")
 
 
 LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1")
@@ -1414,6 +1857,26 @@ def main():
     p = sub.add_parser("all", help="전체 파이프라인")
     p.add_argument("--size", type=int, default=480)
     p.set_defaults(func=cmd_all)
+
+    p = sub.add_parser("chapters", help="영상 챕터 확인 / 초안 만들기")
+    p.add_argument("--init", action="store_true", help="초안을 만들어 data/chapters.json 에 저장")
+    p.add_argument("--count", type=int, default=6, help="챕터 개수 (기본 6)")
+    p.add_argument("--target", type=int, help=f"영상 전체 목표 길이(초, 기본 {DEFAULT_TARGET_SEC})")
+    p.set_defaults(func=cmd_chapters)
+
+    p = sub.add_parser("music", help="배경음악 BPM·첫 박·후렴 구간 설정")
+    p.add_argument("--file", help="음악 파일 경로 (예: music/main.m4a)")
+    p.add_argument("--bpm", type=float, help="분당 박자 수")
+    p.add_argument("--offset", type=float, help="첫 박이 시작하는 위치(초)")
+    p.add_argument("--chorus", help="후렴 구간 — '48-80, 140-172' 처럼 초 단위")
+    p.set_defaults(func=cmd_music)
+
+    p = sub.add_parser("plan", help="태그+챕터+음악 → 컷 리스트(영상 계획)")
+    p.add_argument("--with-untagged", action="store_true",
+                   help="아직 고르지 않은 사진도 '보통'으로 넣기")
+    p.add_argument("--no-stretch", dest="stretch", action="store_false",
+                   help="컷이 모자라도 길이를 늘리지 않기")
+    p.set_defaults(func=cmd_plan, stretch=True)
 
     p = sub.add_parser("bundle", help="원본 없이 썸네일만 담은 공유용 정적 번들")
     p.add_argument("--out", default="dist", help="출력 폴더 (기본 dist)")
@@ -1614,6 +2077,42 @@ body.onlyuntagged .shot:not(.untagged),body.onlyuntagged .day.hide{display:none}
 #help code{background:var(--soft);border-radius:5px;padding:1px 6px;font-size:13px;color:var(--accent-ink)}
 #help .x{position:absolute;top:12px;right:16px;background:none;border:0;font-size:28px;
   color:var(--dim);cursor:pointer;line-height:1}
+/* ---------- 챕터 · 음악 ---------- */
+#chap{position:fixed;inset:0;z-index:60;background:rgba(60,45,40,.35);backdrop-filter:blur(6px);
+  display:none;align-items:center;justify-content:center;padding:20px}
+#chap.on{display:flex}
+#chap .panel{position:relative;max-width:760px;width:100%;max-height:88vh;overflow:auto;
+  background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:28px 30px;
+  box-shadow:var(--sh-lg)}
+#chap h3{margin:0 0 6px;font-size:22px;color:#493e3a;letter-spacing:-.02em}
+#chap h4{margin:26px 0 10px;font-size:16px;color:var(--accent-ink)}
+#chap .lead{margin:0 0 18px;color:#7d6f6a;font-size:13px;line-height:1.65}
+#chap .x{position:absolute;top:12px;right:16px;background:none;border:0;font-size:28px;
+  color:var(--dim);cursor:pointer;line-height:1}
+#chap .crow{display:grid;grid-template-columns:1fr 104px 104px 68px 96px 30px;gap:6px;
+  margin-bottom:6px;align-items:center}
+#chap .chead{font-size:11px;color:var(--dim);padding:0 2px}
+#chap input,#chap select{width:100%;border:1px solid var(--line);background:#fdfaf9;color:var(--fg);
+  border-radius:9px;padding:9px 10px;font:14px inherit;outline:0}
+#chap input:focus,#chap select:focus{border-color:var(--accent);background:#fff}
+#chap .crow .del{border:1px solid var(--line);background:#fff;border-radius:9px;cursor:pointer;
+  color:var(--dim);font-size:16px;line-height:1;padding:8px 0}
+#chap .crow .del:hover{border-color:var(--warn);color:var(--warn)}
+#chap .row{display:flex;gap:8px;align-items:center;margin-top:14px;flex-wrap:wrap}
+#chap .row button{border:1px solid var(--line);background:#fff;color:var(--fg);border-radius:11px;
+  padding:11px 16px;font:14px inherit;cursor:pointer}
+#chap .row button:hover{border-color:var(--accent)}
+#chap .row button.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:700}
+#chap .row label{font-size:13px;color:var(--dim);display:flex;align-items:center;gap:6px}
+#chap .row label input{width:78px}
+#chap .musicgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:9px}
+#chap .musicgrid label{font-size:12px;color:var(--dim);display:flex;flex-direction:column;gap:5px}
+#chap .planout{margin-top:18px;font-size:13px;line-height:1.7;color:#6b5c57}
+#chap .planout .big{font-size:17px;color:var(--accent-ink);font-weight:700}
+#chap .planout ul{margin:8px 0 0;padding-left:18px}
+#chap .planout .w{color:#8a6a30}
+@media(max-width:640px){#chap .crow{grid-template-columns:1fr 1fr;gap:5px}
+  #chap .crow .del{grid-column:2}}
 #lb{position:fixed;inset:0;z-index:50;background:rgba(252,247,245,.93);
   backdrop-filter:blur(10px);display:none;padding:18px;overflow:hidden}
 #lb.on{display:flex;align-items:center;justify-content:center;gap:22px}
@@ -1686,6 +2185,13 @@ body.onlyuntagged .shot:not(.untagged),body.onlyuntagged .day.hide{display:none}
   border-radius:11px;cursor:pointer;font:13px inherit;color:var(--dim)}
 #lb .short button:hover{border-color:var(--accent);color:var(--accent-ink)}
 #lb .tagbox .row{margin-top:16px}
+/* 영상 구간 — 영상일 때만 보인다 */
+#lb .clipbox{display:none}
+#lb.isvideo .clipbox{display:block}
+#lb .clipnow{font-size:13px;color:var(--accent-ink);background:#fff;border:1px solid var(--line);
+  border-radius:11px;padding:9px 12px;margin-bottom:7px;font-variant-numeric:tabular-nums}
+#lb .clipnow b{font-weight:700}
+#lb .seg.four button{font-size:13px;padding:9px 0}
 /* 키보드가 없는 기기(폰·태블릿)에서도 얼굴 위치를 지울 수 있게 */
 #lb .linkbtn{background:none;border:0;color:var(--dim);font:12px inherit;cursor:pointer;
   text-decoration:underline;padding:5px 0 0}
@@ -1751,6 +2257,7 @@ body.onlyuntagged .shot:not(.untagged),body.onlyuntagged .day.hide{display:none}
     <button id="nextBtn" title="설명이 비어 있는 다음 사진으로 건너뜁니다">다음 미작성 →</button>
     <button id="tagBtn" title="돌잔치 영상에 쓸 컷을 고르고 인물·얼굴 위치를 찍습니다">🎬 영상 태깅</button>
     <button id="untaggedBtn" title="아직 고르지 않은 사진만 남깁니다">태깅 안 한 것만</button>
+    <button id="chapBtn" title="영상의 챕터·음악을 정하고 컷 리스트를 계산합니다">🎞 챕터·음악</button>
     <button id="rebuildBtn" title="바뀐 내용으로 이 페이지와 LOG.md 를 다시 만듭니다">↻ 다시 빌드</button>
     <button id="organizeBtn" title="staging 폴더의 새 사진을 날짜·장소별로 정리합니다">📂 새 사진 정리</button>
     <button id="exportBtn" title="서버 없이 열었을 때 브라우저에 쌓인 수정본을 파일로 내려받습니다">⇩ 수정본 내보내기</button>
@@ -1804,8 +2311,27 @@ body.onlyuntagged .shot:not(.untagged),body.onlyuntagged .day.hide{display:none}
             가로 사진을 세로 영상에 넣거나 확대·이동 효과를 줄 때 <b>얼굴이 잘리지 않게</b> 하는 기준점입니다.</li>
         <li><b>🔒 비공개</b> — <code>P</code>. 목욕·병원 사진처럼 하객 앞에 띄우면 안 되는 컷.
             <code>jiho.py bundle</code> 로 만드는 공유용 번들에서 썸네일까지 빠집니다.</li>
+        <li><b>마일스톤</b> — 백일·첫 걸음·여행처럼 <b>챕터를 나누고 "처음으로…" 자막 카드를
+            만드는 재료</b>입니다. 해당하는 사진에만 붙이면 됩니다.</li>
+        <li><b>영상 구간</b>(영상에서만) — 재생하다가 <code>I</code> 로 시작, <code>O</code> 로 끝을
+            찍습니다. 안 잡으면 앞 6초만 씁니다. <code>M</code> 은 소리 — <b>아기 웃음·옹알이가
+            든 컷은 소리를 살리고</b>, 그 구간만 배경음악을 줄이도록 계획에 표시됩니다.</li>
         <li><code>N</code> 은 아직 안 고른 다음 사진, <code>←</code> <code>→</code> 는 이전·다음입니다.</li>
         </ul></dd>
+    <dt>🎞 챕터·음악</dt>
+    <dd>영상의 뼈대입니다. <b>챕터</b>마다 기간과 목표 길이(초)를 정하고, <b>음악</b>의 BPM·첫 박·후렴
+        구간을 적습니다. [초안 만들기]는 사진이 몰린 정도에 맞춰 챕터를 자동으로 나눠줍니다.
+        <ul style="margin:8px 0 0;padding-left:18px">
+        <li><b>▶ 영상 계획 만들기</b> — 태그해 둔 컷 중에서 <b>어떤 컷을 몇 번째에 몇 초씩</b> 쓸지
+            계산해 <code>VIDEO_PLAN.md</code>(읽기용)와 <code>data/video_plan.json</code>(편집
+            프로그램용)으로 내보냅니다.</li>
+        <li>BPM 을 넣으면 컷이 <b>박자에 맞고</b>, 후렴 구간에서는 절반 길이로 몰아칩니다.
+            영상은 다음 컷이 박에서 밀리지 않도록 뒤를 조금 채웁니다.</li>
+        <li>챕터 시간이 모자라면 <b>★ 꼭</b> 을 남기고 <b>같은 시간대에 몰린 컷부터</b> 뺍니다.
+            무엇이 빠졌는지, 자막·얼굴 위치가 빠진 컷이 무엇인지 계획에 같이 적힙니다.</li>
+        </ul>
+        터미널에서는 <code>jiho.py chapters --init</code>, <code>jiho.py music --bpm 92</code>,
+        <code>jiho.py plan</code> 으로도 할 수 있습니다.</dd>
     <dt>사진 크게 보기 → ✎ 수정</dt>
     <dd>사진을 크게 열면 요약·촬영 일시·장소는 <b>읽기 전용</b>입니다.
         <b>✎ 수정</b>을 누르면(또는 그 칸을 그냥 눌러도) 입력칸이 열리고 <b>저장</b> 버튼이 나타납니다.
@@ -1823,6 +2349,35 @@ body.onlyuntagged .shot:not(.untagged),body.onlyuntagged .day.hide{display:none}
         (예: <code>물놀이</code> → 튜브 탄 컷, <code>꽃</code> → 벚꽃·유채꽃).</dd>
   </dl>
 </div></div>
+<div id="chap"><div class="panel">
+  <button class="x">&times;</button>
+  <h3>🎞 챕터 · 음악</h3>
+  <p class="lead">영상의 뼈대입니다. 챕터마다 <b>기간</b>과 <b>목표 길이</b>를 정해두면,
+     [영상 계획 만들기]가 태그해 둔 컷을 골라 <b>몇 번째에 몇 초씩</b> 넣을지까지 계산해
+     <code>VIDEO_PLAN.md</code> 와 <code>data/video_plan.json</code> 으로 내보냅니다.
+     음악 BPM 을 넣으면 컷이 박자에 맞고, 후렴 구간에서는 절반 길이로 몰아칩니다.</p>
+  <div class="crow chead"><span>제목</span><span>시작</span><span>끝</span><span>초</span>
+    <span>분위기</span><span></span></div>
+  <div id="chapList"></div>
+  <div class="row">
+    <button id="addChap">+ 챕터</button>
+    <button id="draftChap" title="사진이 몰린 정도에 맞춰 자동으로 나눕니다">초안 만들기</button>
+    <label>전체 목표 <input id="chapTarget" type="number" min="10" step="10"> 초</label>
+  </div>
+  <h4>음악</h4>
+  <div class="musicgrid">
+    <label>파일<input id="mFile" placeholder="music/main.m4a"></label>
+    <label>BPM<input id="mBpm" type="number" step="0.1" placeholder="92"></label>
+    <label>첫 박(초)<input id="mOff" type="number" step="0.01" placeholder="0.35"></label>
+    <label>후렴 구간<input id="mChorus" placeholder="48-80, 140-172"></label>
+  </div>
+  <div class="row">
+    <button class="primary" id="saveChap">저장</button>
+    <button id="makePlan">▶ 영상 계획 만들기</button>
+    <label><input type="checkbox" id="planAll" style="width:auto"> 아직 안 고른 사진도 포함</label>
+  </div>
+  <div class="planout" id="planOut"></div>
+</div></div>
 <div id="lb">
   <div class="wash"></div>
   <button class="close">&times;</button>
@@ -1839,6 +2394,17 @@ body.onlyuntagged .shot:not(.untagged),body.onlyuntagged .day.hide{display:none}
       </div>
       <label>같이 나온 사람 <span class="keys">A S D F G H J K L</span></label>
       <div class="chips" id="fPeople"></div>
+      <label>마일스톤 <span class="keys">챕터·자막 카드의 재료</span></label>
+      <div class="chips" id="fTags"></div>
+      <div class="clipbox">
+        <label>영상 구간 <span class="keys">I 시작 · O 끝 · M 소리</span></label>
+        <div class="clipnow" id="clipNow"></div>
+        <div class="seg four">
+          <button id="clipIn">I 시작</button><button id="clipOut">O 끝</button>
+          <button id="clipPlay">▶ 구간</button><button id="clipClear">지우기</button>
+        </div>
+        <button class="linkbtn" id="audioBtn"></button>
+      </div>
       <label>영상 자막 <span class="keys">12~14자</span></label>
       <div class="short">
         <input id="fShort" maxlength="40" placeholder="예: 백일, 처음 웃던 날">
@@ -2008,6 +2574,7 @@ function show(i){
     ? `GPS ${d.geokey}${d.auto?` · 자동판정 "${d.auto}"`:''}`
     : 'GPS 정보 없음') + ` · 현재 출처: ${psrc}`;
   lb.classList.add('on');
+  lb.classList.toggle('isvideo', d.kind==='video');
   renderTags();          // 사진 위 과녁을 그리려면 라이트박스가 보인 뒤여야 한다
 }
 async function close(){
@@ -2126,7 +2693,7 @@ $('#savePlaceBtn').onclick=async()=>{
 // 얼굴이 살아남는지"가 데이터에 있어야 한다. 130장을 빠르게 훑는 작업이라
 // 여기서는 누르는 즉시 저장한다 — 요약·날짜·장소의 [✎ 수정]과 다른 방식이다.
 const PKEYS='asdfghjkl';
-let roster={{ROSTER}};
+let roster={{ROSTER}}, milestones={{MILESTONES}};
 const esc=s=>String(s).replace(/[<>&"]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
 
 const tagOf=s=>({
@@ -2136,6 +2703,9 @@ const tagOf=s=>({
   face:   s.dataset.face||'',
   people: s.dataset.ppl?s.dataset.ppl.split(','):[],
   short:  s.dataset.short||'',
+  tags:   s.dataset.tg?s.dataset.tg.split(','):[],
+  clip:   s.dataset.clip?s.dataset.clip.split(',').map(Number):null,
+  audio:  s.dataset.audio||'mute',
 });
 function tagStats(){
   let done=0,must=0,drop=0;
@@ -2150,7 +2720,8 @@ function paintShot(s){
   s.classList.add(t.pick===null?'untagged':'pick'+t.pick);
   s.classList.toggle('priv',t.priv);
   const marks=[t.pick===2?'★':t.pick===1?'·':t.pick===0?'✕':'', t.priv?'🔒':'',
-               t.focus?'◎':'', t.people.length?`<em>${t.people.length}</em>`:''].filter(Boolean).join('');
+               t.focus?'◎':'', t.clip?'✂':'', t.audio==='keep'?'🔊':'',
+               t.people.length?`<em>${t.people.length}</em>`:''].filter(Boolean).join('');
   let el=s.querySelector('.tagmark');
   if(!marks){ if(el) el.remove(); return; }
   if(!el){ el=document.createElement('span'); el.className='tagmark';
@@ -2164,6 +2735,9 @@ function applyTag(s,patch){
   if('face' in patch)    s.dataset.face  = patch.face||'';
   if('people' in patch)  s.dataset.ppl   = (patch.people||[]).join(',');
   if('short' in patch)   s.dataset.short = patch.short||'';
+  if('tags' in patch)    s.dataset.tg    = (patch.tags||[]).join(',');
+  if('clip' in patch)    s.dataset.clip  = patch.clip?patch.clip.map(v=>+v.toFixed(2)).join(','):'';
+  if('audio' in patch)   s.dataset.audio = patch.audio==='keep'?'keep':'';
   paintShot(s);
 }
 async function saveTag(patch,msg){
@@ -2189,6 +2763,13 @@ function renderTags(){
     + `<button class="add" id="addPerson" title="목록에 사람을 추가합니다">+ 사람</button>`;
   box.querySelectorAll('button[data-n]').forEach(b=>b.onclick=()=>togglePerson(b.dataset.n));
   $('#addPerson').onclick=addPerson;
+  const tb=$('#fTags');
+  tb.innerHTML = milestones.map(n=>
+      `<button data-t="${esc(n)}"${t.tags.includes(n)?' class="on"':''}>${esc(n)}</button>`).join('')
+    + `<button class="add" id="addTag" title="목록에 항목을 추가합니다">+ 항목</button>`;
+  tb.querySelectorAll('button[data-t]').forEach(b=>b.onclick=()=>toggleTag(b.dataset.t));
+  $('#addTag').onclick=addMilestone;
+  renderClip(t);
   if(document.activeElement!==$('#fShort')) $('#fShort').value=t.short;
   $('#focusHint').textContent = t.focus
     ? `지정됨 — 가로 ${Math.round(t.focus[0]*100)}% · 세로 ${Math.round(t.focus[1]*100)}% (다시 클릭하면 옮깁니다)`
@@ -2222,6 +2803,11 @@ function togglePerson(n){
   const people=t.people.includes(n)?t.people.filter(x=>x!==n):t.people.concat([n]);
   saveTag({people}, people.length?`인물: ${people.join(', ')}`:'인물 없음');
 }
+function toggleTag(n){
+  const t=tagOf(shots[cur]);
+  const tags=t.tags.includes(n)?t.tags.filter(x=>x!==n):t.tags.concat([n]);
+  saveTag({tags}, tags.length?`마일스톤: ${tags.join(', ')}`:'마일스톤 없음');
+}
 async function addPerson(){
   const n=(prompt('추가할 사람 이름 (예: 고모)')||'').trim();
   if(!n) return;
@@ -2231,6 +2817,53 @@ async function addPerson(){
     catch(e){ say('사람 목록 저장 실패: '+e.message,'err'); }
   }
   togglePerson(n);
+}
+async function addMilestone(){
+  const n=(prompt('추가할 마일스톤 (예: 첫 수영)')||'').trim();
+  if(!n) return;
+  if(!milestones.includes(n)){
+    milestones=milestones.concat([n]);
+    try{ if(live) await api('/api/note',{milestones}); else stash('__roster__',{milestones}); }
+    catch(e){ say('마일스톤 목록 저장 실패: '+e.message,'err'); }
+  }
+  toggleTag(n);
+}
+
+// ── 영상 구간 ──────────────────────────────────────────
+// 아기 웃음소리가 든 3초가 사진 스무 장보다 세다. 어디를 쓸지와
+// 소리를 살릴지를 여기서 정한다. (영상에만 나타난다)
+const vid=()=>stage.querySelector('video');
+const secs=v=>`${v.toFixed(1)}초`;
+function renderClip(t){
+  if(!lb.classList.contains('isvideo')) return;
+  const total=+(shots[cur].dataset.dur||0);
+  $('#clipNow').innerHTML = t.clip
+    ? `<b>${secs(t.clip[0])} → ${secs(t.clip[1])}</b> · 길이 ${secs(t.clip[1]-t.clip[0])}`
+      + (total?` <span style="opacity:.55">/ 전체 ${secs(total)}</span>`:'')
+    : `구간을 안 잡으면 <b>앞 ${secs(Math.min(6,total||6))}</b> 를 그대로 씁니다`
+      + (total?` <span style="opacity:.55">(전체 ${secs(total)})</span>`:'');
+  $('#audioBtn').textContent = t.audio==='keep'
+    ? '🔊 소리 살림 — 배경음악을 이 구간만 줄입니다 (끄려면 클릭)'
+    : '🔇 음소거 — 아기 목소리를 살리려면 클릭 (M)';
+}
+function setClipPoint(which){
+  const v=vid();
+  if(!v) return say('영상에서만 쓸 수 있습니다','err');
+  const t=+v.currentTime.toFixed(2), total=v.duration||+(shots[cur].dataset.dur||0)||t+6;
+  const c=tagOf(shots[cur]).clip;
+  let a,b;
+  if(which==='in'){ a=t; b=(c&&c[1]>t)?c[1]:Math.min(total,t+6); }
+  else            { b=t; a=(c&&c[0]<t)?c[0]:Math.max(0,t-6); }
+  if(b-a<0.2) return say('구간이 너무 짧습니다 (0.2초 이상)','err');
+  saveTag({clip:[a,b]}, which==='in'?`시작 ${secs(a)}`:`끝 ${secs(b)}`);
+}
+function playClip(){
+  const v=vid(), c=tagOf(shots[cur]).clip;
+  if(!v) return;
+  const [a,b]=c||[0,Math.min(6,v.duration||6)];
+  v.currentTime=a; v.play().catch(()=>{});
+  const stop=()=>{ if(v.currentTime>=b){ v.pause(); v.removeEventListener('timeupdate',stop); } };
+  v.addEventListener('timeupdate',stop);
 }
 // 요약에서 자막 초안: '긴 설명 — 짧은 말' 중 짧은 쪽을 쓴다.
 // 길면 단어 경계에서 자르되, 조금 넘는 정도는 그대로 둔다(말이 잘리는 게 더 나쁘다).
@@ -2256,6 +2889,12 @@ $('#privBtn').onclick=()=>{const t=tagOf(shots[cur]);
   saveTag({private:!t.priv}, t.priv?'비공개 해제':'🔒 비공개 — 공유·영상에서 뺍니다');};
 $('#nextTagBtn').onclick=nextUntagged;
 $('#clearFocusBtn').onclick=()=>saveTag({focus:null},'얼굴 위치 지움');
+$('#clipIn').onclick=()=>setClipPoint('in');
+$('#clipOut').onclick=()=>setClipPoint('out');
+$('#clipPlay').onclick=playClip;
+$('#clipClear').onclick=()=>saveTag({clip:null},'영상 구간 지움');
+$('#audioBtn').onclick=()=>{const t=tagOf(shots[cur]);
+  saveTag({audio:t.audio==='keep'?'mute':'keep'}, t.audio==='keep'?'음소거':'🔊 소리 살림');};
 $('#shortFromSum').onclick=()=>{
   const cap=shots[cur].dataset.cap||'';
   if(!cap) return say('요약이 비어 있어 가져올 것이 없습니다','err');
@@ -2318,7 +2957,8 @@ lb.querySelector('.next').onclick=e=>{e.stopPropagation();go(cur+1)};
 lb.addEventListener('click',e=>{if(e.target===lb)close()});
 document.addEventListener('keydown',e=>{
   if(!lb.classList.contains('on'))return;
-  const typing=/INPUT|TEXTAREA/.test(document.activeElement.tagName);
+  if(chap.classList.contains('on'))return;       // 챕터 창이 떠 있으면 그쪽이 먼저다
+  const typing=/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName);
   // 수정 중이면 Esc 는 먼저 수정을 접는다 — 한 번 더 눌러야 닫힌다
   if(e.key==='Escape'){ if(lb.classList.contains('editing')) cancelEdit(); else close(); return; }
   if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();
@@ -2333,6 +2973,10 @@ document.addEventListener('keydown',e=>{
   if(k==='p'){saveTag({private:!tagOf(shots[cur]).priv},'비공개 전환');return;}
   if(k==='c'){saveTag({focus:null},'얼굴 위치 지움');return;}
   if(k==='n'){nextUntagged();return;}
+  if(k==='i'||k==='o'){e.preventDefault();setClipPoint(k==='i'?'in':'out');return;}
+  if(k==='m'){const t=tagOf(shots[cur]);
+              saveTag({audio:t.audio==='keep'?'mute':'keep'},
+                      t.audio==='keep'?'음소거':'🔊 소리 살림');return;}
   const pi=PKEYS.indexOf(k);
   if(pi>=0&&pi<roster.length)togglePerson(roster[pi]);
 });
@@ -2359,7 +3003,10 @@ const help=$('#help');
 $('#helpBtn').onclick=()=>help.classList.add('on');
 help.querySelector('.x').onclick=()=>help.classList.remove('on');
 help.addEventListener('click',e=>{if(e.target===help)help.classList.remove('on')});
-document.addEventListener('keydown',e=>{if(e.key==='Escape')help.classList.remove('on')});
+document.addEventListener('keydown',e=>{
+  if(e.key!=='Escape')return;
+  help.classList.remove('on'); $('#chap').classList.remove('on');
+});
 
 $('#editBtn').onclick=e=>{document.body.classList.toggle('edit');
   e.target.classList.toggle('on',document.body.classList.contains('edit'));};
@@ -2384,6 +3031,93 @@ $('#untaggedBtn').onclick=e=>{
   const t=tagStats();
   say(on?`아직 안 고른 ${t.total-t.done}장만 보입니다`:'전체 보기','ok');
 };
+// ── 챕터 · 음악 ────────────────────────────────────────
+// 영상의 뼈대. 챕터(기간·목표 길이)와 음악(BPM·후렴)이 정해지면
+// [영상 계획 만들기]가 컷 리스트를 계산해 VIDEO_PLAN.md 로 내보낸다.
+let CHAPS={{CHAPTERS}}, MUSIC={{MUSIC}};
+const MOODS={{MOODS}};
+const chap=$('#chap');
+
+function chapRow(c,i){
+  const opts=['',...MOODS].map(m=>
+    `<option${m===(c.mood||'')?' selected':''}>${esc(m)}</option>`).join('');
+  return `<div class="crow" data-i="${i}">
+    <input class="ct" value="${esc(c.title||'')}" placeholder="챕터 제목">
+    <input class="cf" value="${esc(c.from||'')}" placeholder="2025-08-09">
+    <input class="cto" value="${esc(c.to||'')}" placeholder="2025-09-17">
+    <input class="cs" type="number" min="1" value="${+c.sec||30}">
+    <select class="cm">${opts}</select>
+    <button class="del" title="이 챕터 지우기">&times;</button></div>`;
+}
+function renderChaps(){
+  $('#chapList').innerHTML=(CHAPS.chapters||[]).map(chapRow).join('')
+    || '<p class="lead">아직 챕터가 없습니다 — [초안 만들기] 를 눌러보세요.</p>';
+  $('#chapTarget').value=CHAPS.target_sec||300;
+  $('#chapList').querySelectorAll('.del').forEach(b=>b.onclick=()=>{
+    CHAPS.chapters=readChaps().filter((_,k)=>k!==+b.closest('.crow').dataset.i);
+    renderChaps();
+  });
+  $('#mFile').value=MUSIC.file||''; $('#mBpm').value=MUSIC.bpm||'';
+  $('#mOff').value=MUSIC.offset||'';
+  $('#mChorus').value=(MUSIC.sections||[]).map(s=>`${s.from}-${s.to}`).join(', ');
+}
+function readChaps(){
+  return [...$('#chapList').querySelectorAll('.crow')].map(r=>({
+    title:r.querySelector('.ct').value.trim(), from:r.querySelector('.cf').value.trim(),
+    to:r.querySelector('.cto').value.trim(), sec:+r.querySelector('.cs').value||30,
+    mood:r.querySelector('.cm').value}));
+}
+function readMusic(){
+  const sections=[];
+  ($('#mChorus').value||'').split(/[,;]/).forEach(part=>{
+    const m=part.match(/\s*([\d.]+)\s*[-~]\s*([\d.]+)\s*$/);
+    if(m) sections.push({name:'chorus',from:+m[1],to:+m[2]});
+  });
+  return {file:$('#mFile').value.trim(), bpm:+$('#mBpm').value||0,
+          offset:+$('#mOff').value||0, sections};
+}
+$('#chapBtn').onclick=()=>{renderChaps();chap.classList.add('on');};
+chap.querySelector('.x').onclick=()=>chap.classList.remove('on');
+chap.addEventListener('click',e=>{if(e.target===chap)chap.classList.remove('on')});
+$('#addChap').onclick=()=>{
+  const last=readChaps().slice(-1)[0];
+  CHAPS.chapters=readChaps().concat([{title:'',from:last?last.to:'',to:'',sec:30,mood:''}]);
+  renderChaps();
+};
+$('#draftChap').onclick=async()=>{
+  if(!live) return say('초안 만들기는 서버로 열었을 때만 됩니다','err');
+  if((readChaps().length) && !confirm('지금 챕터 목록을 초안으로 덮어쓸까요?')) return;
+  try{ const j=await api('/api/chapters',{draft:true,target_sec:+$('#chapTarget').value||300});
+       CHAPS.chapters=j.chapters; renderChaps(); say('초안을 만들었습니다 — 고친 뒤 [저장]','ok'); }
+  catch(e){ say('실패: '+e.message,'err'); }
+};
+$('#saveChap').onclick=async()=>{
+  const body={target_sec:+$('#chapTarget').value||300, chapters:readChaps()};
+  MUSIC=readMusic();
+  try{
+    if(live){ await api('/api/chapters',body); await api('/api/music',MUSIC); }
+    else { stash('__chapters__',body); stash('__music__',MUSIC); }
+    CHAPS=body; say('챕터·음악을 저장했습니다','ok');
+  }catch(e){ say('저장 실패: '+e.message,'err'); }
+};
+$('#makePlan').onclick=async()=>{
+  if(!live) return say('영상 계획은 서버로 열었을 때만 만들 수 있습니다','err');
+  say('계획 계산 중…');
+  const box=$('#planOut');
+  try{
+    const j=await api('/api/plan',{with_untagged:$('#planAll').checked});
+    const p=j.plan, mm=Math.floor(p.total_sec/60), ss=Math.round(p.total_sec%60);
+    box.innerHTML=`<div class="big">${p.cuts}컷 · ${mm}분 ${ss}초 <span style="opacity:.6">`
+      +`(목표 ${p.target_sec}초)</span></div>`
+      +`<ul>${p.chapters.map(c=>`<li>${esc(c.title)} — ${c.dur_sec.toFixed(1)}초 · `
+      +`${c.cuts.length}컷${c.dropped?` <span class="w">(${c.dropped}컷 뺌)</span>`:''}</li>`).join('')}</ul>`
+      +(p.warnings.length?`<p class="w">⚠︎ 확인할 것 ${p.warnings.length}건</p><ul class="w">`
+        +p.warnings.slice(0,8).map(w=>`<li>${esc(w)}</li>`).join('')+`</ul>`:'')
+      +`<p>VIDEO_PLAN.md · data/video_plan.json 에 저장했습니다.</p>`;
+    say('영상 계획을 만들었습니다','ok');
+  }catch(e){ box.innerHTML=''; say('실패: '+e.message,'err'); }
+};
+
 $('#rebuildBtn').onclick=async()=>{ say('다시 빌드 중…');
   try{ await api('/api/rebuild',{}); location.reload(); }catch(e){ say('실패: '+e.message,'err'); } };
 $('#organizeBtn').onclick=async()=>{
