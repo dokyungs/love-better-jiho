@@ -96,6 +96,25 @@ FALLBACK_SEC = {2: 3.0, 1: 1.8}  # BPM 을 모를 때 쓰는 초 단위 길이
 CLIP_MAX_SEC = 6.0               # in/out 을 안 잡은 영상에서 기본으로 쓸 길이
 MOODS = ["잔잔하게", "밝게", "신나게", "뭉클하게"]
 
+# ---- 한 화면에 몇 장을 넣을까 -----------------------------------------
+# 화면(16:9)에 사진 한 장을 꽉 채우면 두 가지가 문제가 된다.
+#   1) 사진이 화면보다 작으면 늘려야 하고 → 뿌옇다
+#   2) 세로 사진을 가로 화면에 채우면 위아래가 크게 잘린다 (69% 손실)
+# 여러 장을 나눠 넣으면 칸이 작아져 늘릴 필요가 없고, 세로 사진은 세로로 긴
+# 칸에 들어가 거의 안 잘린다. 스틸컷을 여러 장 붙인 것 같은 화면이 된다.
+FRAME_DEFAULT = (1920, 1080)
+MAX_UPSCALE = 1.15               # 이보다 더 늘려야 하면 '해상도 부족'
+KEEP_MIN = 0.45                  # 사진의 45% 미만만 남으면 '너무 잘림'
+GROUP_MODES = ("auto", "fill", "off")   # 해상도 부족만 / 잘림까지 / 안 묶음
+GROUP_BEATS = {2: 1.6, 3: 2.1, 4: 2.5}  # 여러 장은 읽을 시간이 더 필요하다
+CELLS = {                        # 화면을 나눈 칸 (x, y, 너비, 높이 — 0~1 비율)
+    "full":  [(0, 0, 1, 1)],
+    "row2":  [(0, 0, .5, 1), (.5, 0, .5, 1)],
+    "row3":  [(0, 0, 1 / 3, 1), (1 / 3, 0, 1 / 3, 1), (2 / 3, 0, 1 / 3, 1)],
+    "col2":  [(0, 0, 1, .5), (0, .5, 1, .5)],
+    "grid4": [(0, 0, .5, .5), (.5, 0, .5, .5), (0, .5, .5, .5), (.5, .5, .5, .5)],
+}
+
 
 # --------------------------------------------------------------------- 공통
 
@@ -814,6 +833,8 @@ def _shot_html(m, summaries, size, out=None, lite=False, keep=None, edits=None):
         "clip": f"{clip[0]},{clip[1]}" if clip else "",
         "audio": e.get("audio") or "",
         "dur": m.get("duration_sec") or "",
+        "solo": "1" if e.get("solo") else "",
+        "w": _disp_size(m)[0] or "", "h": _disp_size(m)[1] or "",
     })
     attrs = " ".join(f'data-{k}="{html.escape(str(v), quote=True)}"' for k, v in data.items())
     return (f'<figure class="shot {shot_shape(m)}{" vid" if vid else ""}'
@@ -836,6 +857,7 @@ def _tagmark_html(e) -> str:
         "◎" if e.get("focus") else "",
         "✂" if e.get("clip") else "",
         "🔊" if e.get("audio") == "keep" else "",
+        "◻" if e.get("solo") else "",
         f"<em>{len(e['people'])}</em>" if e.get("people") else "",
     ]))
     return f'<span class="tagmark">{marks}</span>' if marks else ""
@@ -1226,6 +1248,11 @@ def _clean_tag(entry: dict, p: dict) -> dict:
             entry["private"] = True
         else:
             entry.pop("private", None)
+    if "solo" in p:                       # 다른 사진과 묶지 말고 한 화면에 크게
+        if p["solo"]:
+            entry["solo"] = True
+        else:
+            entry.pop("solo", None)
     if "focus" in p:
         f = p["focus"]
         if not f:
@@ -1305,7 +1332,12 @@ def _save_tag(p):
 
 def load_chapters() -> dict:
     c = load_json(CHAPTERS_JSON, {})
+    mode = c.get("group_mode")
     return {"target_sec": int(c.get("target_sec") or DEFAULT_TARGET_SEC),
+            "width": int(c.get("width") or FRAME_DEFAULT[0]),
+            "height": int(c.get("height") or FRAME_DEFAULT[1]),
+            "max_upscale": float(c.get("max_upscale") or MAX_UPSCALE),
+            "group_mode": mode if mode in GROUP_MODES else "auto",
             "chapters": [x for x in c.get("chapters", []) if isinstance(x, dict)]}
 
 
@@ -1332,7 +1364,13 @@ def _save_chapters(p):
                     "mood": str(c.get("mood") or "").strip(),
                     "note": str(c.get("note") or "").strip()})
     out.sort(key=lambda c: c["from"])
+    cur = load_chapters()
+    mode = p.get("group_mode", cur["group_mode"])
     data = {"target_sec": max(10, int(p.get("target_sec") or DEFAULT_TARGET_SEC)),
+            "width": max(320, int(p.get("width") or cur["width"])),
+            "height": max(320, int(p.get("height") or cur["height"])),
+            "max_upscale": max(1.0, min(3.0, float(p.get("max_upscale") or cur["max_upscale"]))),
+            "group_mode": mode if mode in GROUP_MODES else "auto",
             "chapters": out}
     save_json(CHAPTERS_JSON, data)
     return {"ok": True, "chapters": len(out)}
@@ -1472,6 +1510,21 @@ def cmd_chapters(args):
     items = apply_overrides(meta["items"])
     notes = load_json(NOTES_JSON, {})
     conf = load_chapters()
+    # 화면 설정만 바꾸는 경우 (챕터는 그대로 둔다)
+    screen = {k: v for k, v in (("group_mode", args.mode), ("max_upscale", args.max_upscale))
+              if v is not None}
+    if args.size:
+        m = re.match(r"\s*(\d+)\s*[x×*]\s*(\d+)\s*$", args.size)
+        if not m:
+            sys.exit("chapters: --size 는 1920x1080 처럼 적어주세요")
+        screen["width"], screen["height"] = int(m.group(1)), int(m.group(2))
+    if screen:
+        r = _save_chapters({**conf, **screen})
+        if not r["ok"]:
+            sys.exit("chapters: " + r["error"])
+        conf = load_chapters()
+        print(f"chapters: 화면 {conf['width']}×{conf['height']} · 최대 확대 "
+              f"{conf['max_upscale']}배 · 묶기 {conf['group_mode']}")
     if args.init or not conf["chapters"]:
         draft = _draft_chapters(items, notes, args.target or conf["target_sec"], args.count)
         if not args.init:
@@ -1529,6 +1582,140 @@ def _in_chorus(t: float, music) -> bool:
     return any(s["from"] <= t < s["to"] for s in music["sections"])
 
 
+def _disp_size(m) -> tuple[int, int]:
+    """화면에 보이는 크기. EXIF orientation 5~8 은 가로/세로가 뒤집혀 저장된다."""
+    w, h = m.get("width") or 0, m.get("height") or 0
+    if m["kind"] == "image" and (m.get("orientation") or 1) in (5, 6, 7, 8):
+        w, h = h, w
+    return w, h
+
+
+def _fit(m, cell, frame) -> tuple[float, float]:
+    """이 칸을 꽉 채울 때 (늘려야 하는 배율, 사진이 안 잘리고 남는 넓이 비율)."""
+    w, h = _disp_size(m)
+    cw, ch = frame[0] * cell[2], frame[1] * cell[3]
+    if not w or not h:
+        return 1.0, 1.0
+    s = max(cw / w, ch / h)                       # 칸을 덮는 배율
+    keep = min(1.0, (cw / s) / w) * min(1.0, (ch / s) / h)
+    return s, keep
+
+
+def _cells_for(ms, n, frame) -> tuple[str, list]:
+    """세로 사진이 많으면 옆으로 나란히, 가로 사진뿐이면 위아래로 쌓는다."""
+    port = sum(1 for m in ms if _disp_size(m)[1] > _disp_size(m)[0])
+    name = ("row2" if port * 2 >= len(ms) else "col2") if n == 2 else "row3" if n == 3 else "grid4"
+    return name, CELLS[name]
+
+
+def _needs_group(m, e, frame, max_up, mode) -> str:
+    """이 컷을 다른 컷과 묶어야 하는 이유 (없으면 '')."""
+    if mode == "off" or m["kind"] != "image" or e.get("solo"):
+        return ""
+    up, keep = _fit(m, CELLS["full"][0], frame)
+    if up > max_up:
+        return f"해상도 부족({up:.2f}배 확대)"
+    if mode == "fill" and keep < KEEP_MIN and e.get("pick") != 2:
+        return f"화면에 채우면 {round((1 - keep) * 100)}% 잘림"
+    return ""
+
+
+def _chunk_run(run, frame, max_up, mode="auto"):
+    """묶어야 할 컷들을 2~4장씩 나눈다.
+
+    해상도 때문에 묶는 것(auto)이면 되도록 적게 묶어 크게 보이도록 하고,
+    화면을 채우려고 묶는 것(fill)이면 사진이 가장 덜 잘리는 장수를 고른다.
+    """
+    out, i = [], 0
+    while i < len(run):
+        best, best_keep = None, -1.0
+        for n in (2, 3, 4):
+            if i + n > len(run):
+                break
+            ms = [x[0] for x in run[i:i + n]]
+            _, cells = _cells_for(ms, n, frame)
+            fits = [_fit(m, c, frame) for m, c in zip(ms, cells)]
+            if any(up > max_up for up, _k in fits):
+                continue
+            keep = sum(k for _u, k in fits) / n
+            if mode != "fill":
+                best = n                       # 조건만 맞으면 가장 적게 묶는다
+                break
+            if keep > best_keep + 0.08:        # 눈에 띄게 덜 잘릴 때만 더 묶는다
+                best, best_keep = n, keep
+        if best is None:                       # 4장으로도 안 되면 있는 만큼 묶는다
+            best = min(4, len(run) - i)
+        if best < 2:                           # 혼자 남으면 그냥 단독으로
+            out.append(run[i:i + 1])
+            i += 1
+            continue
+        out.append(run[i:i + best])
+        i += best
+    # 마지막에 한 장만 남았으면 앞 묶음에 붙여본다 — 붙여서 더 잘리면 그냥 둔다
+    if len(out) >= 2 and len(out[-1]) == 1 and len(out[-2]) < 4:
+        merged = out[-2] + out[-1]
+        up, keep = _chunk_quality(merged, frame)
+        was = (_chunk_quality(out[-2], frame)[1] * len(out[-2])
+               + _chunk_quality(out[-1], frame)[1]) / len(merged)
+        if up <= max_up and keep >= was:
+            out.pop()
+            out[-1] = merged
+    return out
+
+
+def _chunk_quality(chunk, frame) -> tuple[float, float]:
+    """이 묶음의 (가장 큰 확대 배율, 평균으로 남는 넓이)."""
+    ms = [x[0] for x in chunk]
+    n = len(ms)
+    _, cells = ("full", CELLS["full"]) if n == 1 else _cells_for(ms, n, frame)
+    fits = [_fit(m, c, frame) for m, c in zip(ms, cells)]
+    return max(u for u, _k in fits), sum(k for _u, k in fits) / n
+
+
+def _make_units(group, frame, max_up, mode, warn):
+    """컷 목록을 '한 화면' 단위로 묶는다. 묶이지 않은 것은 혼자 한 화면."""
+    units, run = [], []
+
+    def flush():
+        if not run:
+            return
+        for chunk in _chunk_run(run, frame, max_up, mode):
+            if len(chunk) == 1:
+                units.append(_unit([chunk[0]], frame, max_up))
+            else:
+                units.append(_unit(chunk, frame, max_up))
+        run.clear()
+
+    for x in group:
+        m, e, pick, _ = x
+        why = _needs_group(m, e, frame, max_up, mode)
+        if why:
+            run.append(x)
+        else:
+            flush()
+            units.append(_unit([x], frame, max_up))
+    flush()
+
+    # 묶은 뒤에도 늘려야 하는 칸이 남으면 알려준다 (혼자 남았거나 너무 작거나)
+    for u in units:
+        for (m, e, _p, _d), cell in zip(u["items"], u["cells"]):
+            up = _fit(m, cell, frame)[0]
+            if up > max_up and m["kind"] == "image":
+                w, h = _disp_size(m)
+                warn.append(f"{'묶어도 ' if u['n'] > 1 else ''}해상도가 모자랍니다: "
+                            f"{m['file']} ({w}×{h}, {up:.2f}배 확대)")
+    return units
+
+
+def _unit(items, frame, max_up) -> dict:
+    n = len(items)
+    ms = [x[0] for x in items]
+    layout, cells = ("full", CELLS["full"]) if n == 1 else _cells_for(ms, n, frame)
+    kind = "video" if (n == 1 and ms[0]["kind"] == "video") else ("image" if n == 1 else "collage")
+    return {"items": items, "n": n, "layout": layout, "cells": cells, "kind": kind,
+            "pick": max(x[2] for x in items)}
+
+
 def _clip_seconds(m, e) -> float:
     """영상에서 실제로 재생할 길이 — 구간을 안 잡았으면 앞부분을 조금만."""
     clip = e.get("clip")
@@ -1552,11 +1739,23 @@ def _cut_seconds(m, e, pick, beat, chorus, stretch=1.0) -> float:
     return round(FALLBACK_SEC[pick] * (0.5 if chorus else 1.0) * stretch, 3)
 
 
-def _layout(keep, t0, beat, music, stretch=1.0):
+def _unit_seconds(u, beat, chorus, stretch=1.0) -> float:
+    """한 화면이 머무는 시간. 여러 장을 묶은 화면은 읽을 시간을 더 준다."""
+    m, e, pick, _ = u["items"][0]
+    base = _cut_seconds(m, e, u["pick"], beat, chorus, stretch)
+    if u["n"] == 1:
+        return base
+    mult = GROUP_BEATS.get(u["n"], 2.5)
+    if beat:
+        return round(max(1, round(base / beat * mult)) * beat, 3)
+    return round(base * mult, 3)
+
+
+def _layout(units, t0, beat, music, stretch=1.0):
     """컷들을 시간축에 늘어놓는다. 후렴에 걸리는지는 그 컷의 시작 시각으로 정한다."""
     t, durs = t0, []
-    for m, e, pick, _ in keep:
-        dur = _cut_seconds(m, e, pick, beat, _in_chorus(t - music["offset"], music), stretch)
+    for u in units:
+        dur = _unit_seconds(u, beat, _in_chorus(t - music["offset"], music), stretch)
         durs.append(dur)
         t = round(t + dur, 3)
     return durs, round(t - t0, 3)
@@ -1572,6 +1771,7 @@ def cmd_plan(args):
     bday = birthday(notes)
     conf, music = load_chapters(), load_music()
     beat = 60.0 / music["bpm"] if music["bpm"] else 0
+    frame = (conf["width"], conf["height"])
 
     chapters = conf["chapters"]
     warn = []
@@ -1605,11 +1805,13 @@ def cmd_plan(args):
         for x in group:
             used.add(x[0]["file"])
         budget, cstart = float(ch["sec"]), t
+        # 해상도가 낮거나 화면에 안 맞는 컷은 2~4장씩 한 화면으로 묶는다
+        units = _make_units(group, frame, conf["max_upscale"], conf["group_mode"], warn)
         # 예산을 넘으면 '우선순위가 낮고 시간상 가장 붙어 있는' 컷부터 뺀다
-        keep, dropped_must = list(group), 0
+        keep, dropped_must = list(units), 0
         while len(keep) > 1 and _layout(keep, cstart, beat, music)[1] > budget:
             gone = keep.pop(_most_redundant(keep))
-            dropped_must += 1 if gone[2] == 2 else 0
+            dropped_must += sum(1 for x in gone["items"] if x[2] == 2)
         if dropped_must:
             warn.append(f"'{ch['title']}' 에서 ★ 꼭 골라둔 컷 {dropped_must}개가 "
                         f"시간이 모자라 빠졌습니다 — 목표 길이를 늘려주세요")
@@ -1627,31 +1829,53 @@ def cmd_plan(args):
                     break
 
         cuts = []
-        for (m, e, pick, day), dur in zip(keep, durs):
-            cap = e.get("short") or summaries.get(m["file"], "")
-            if not cap:
-                warn.append(f"자막 없음: {m['file']}")
-            if pick == 2 and m["kind"] == "image" and not e.get("focus"):
-                warn.append(f"얼굴 위치 없음(★ 꼭): {m['file']}")
-            src = _clip_seconds(m, e) if m["kind"] == "video" else None
-            if m["kind"] == "video" and not e.get("clip"):
-                warn.append(f"영상 구간 안 잡음: {m['file']} — 앞 {src:.1f}초를 그냥 씁니다"
-                            f" (전체 {m.get('duration_sec')}초)")
+        for u, dur in zip(keep, durs):
+            tiles = []
+            for (m, e, pick, day), cell in zip(u["items"], u["cells"]):
+                cap = e.get("short") or summaries.get(m["file"], "")
+                if not cap:
+                    warn.append(f"자막 없음: {m['file']}")
+                if pick == 2 and m["kind"] == "image" and not e.get("focus") and u["n"] == 1:
+                    warn.append(f"얼굴 위치 없음(★ 꼭): {m['file']}")
+                src = _clip_seconds(m, e) if m["kind"] == "video" else None
+                if m["kind"] == "video" and not e.get("clip"):
+                    warn.append(f"영상 구간 안 잡음: {m['file']} — 앞 {src:.1f}초를 그냥 씁니다"
+                                f" (전체 {m.get('duration_sec')}초)")
+                up, kept = _fit(m, cell, frame)
+                tiles.append({
+                    "file": m["file"], "path": m["path"], "kind": m["kind"],
+                    "motion": m.get("motion") or "", "cell": [round(v, 4) for v in cell],
+                    "caption": cap, "pick": pick, "day": day, "age": age_label(day, bday) or "",
+                    "focus": e.get("focus"), "face": e.get("face") or "",
+                    "people": e.get("people") or [], "tags": e.get("tags") or [],
+                    "clip": e.get("clip"), "src_dur": src, "audio": e.get("audio") or "mute",
+                    "place": m.get("place") or "",
+                    "size": list(_disp_size(m)), "upscale": round(up, 3), "keep": round(kept, 3),
+                    # 늘려도 화질이 안 나오면 꽉 채우지 말고 여백을 두라는 뜻
+                    "fit": "pillarbox" if up > conf["max_upscale"] else "cover",
+                })
+            first = tiles[0]
+            cap = next((x["caption"] for x in tiles if x["pick"] == 2 and x["caption"]),
+                       next((x["caption"] for x in tiles if x["caption"]), ""))
             cuts.append({
-                "at": round(t, 3), "dur": dur, "file": m["file"], "path": m["path"],
-                "kind": m["kind"], "motion": m.get("motion") or "",
-                "day": day, "age": age_label(day, bday) or "",
-                "caption": cap, "pick": pick,
-                "focus": e.get("focus"), "face": e.get("face") or "",
-                "people": e.get("people") or [], "tags": e.get("tags") or [],
-                "clip": e.get("clip"), "src_dur": src, "audio": e.get("audio") or "mute",
-                "place": m.get("place") or "", "beat_aligned": bool(beat) and m["kind"] == "image",
+                "at": round(t, 3), "dur": dur, "kind": u["kind"], "layout": u["layout"],
+                "n": u["n"], "pick": u["pick"], "caption": cap,
+                "day": first["day"], "age": first["age"], "place": first["place"],
+                "people": sorted({p for x in tiles for p in x["people"]}),
+                "tags": sorted({g for x in tiles for g in x["tags"]}),
+                "beat_aligned": bool(beat) and u["kind"] != "video",
+                "tiles": tiles,
+                # 한 장짜리 화면은 편집기가 바로 쓰도록 대표 값을 같이 둔다
+                **({"file": first["file"], "path": first["path"], "focus": first["focus"],
+                    "face": first["face"], "clip": first["clip"], "src_dur": first["src_dur"],
+                    "audio": first["audio"], "motion": first["motion"], "fit": first["fit"]}
+                   if u["n"] == 1 else {}),
             })
             t = round(t + dur, 3)
         out_chapters.append({"title": ch["title"], "from": ch["from"], "to": ch["to"],
                              "mood": ch.get("mood", ""), "target_sec": ch["sec"],
                              "start_sec": round(cstart, 3), "dur_sec": round(t - cstart, 3),
-                             "cuts": cuts, "dropped": len(group) - len(keep)})
+                             "cuts": cuts, "dropped": len(units) - len(keep)})
 
     if t < conf["target_sec"] * 0.9:
         warn.append(f"목표 {conf['target_sec']}초보다 {round(conf['target_sec'] - t)}초 짧습니다 — "
@@ -1664,17 +1888,26 @@ def cmd_plan(args):
     if missing and seen_people:      # 인물 태그를 아예 안 했으면 굳이 알리지 않는다
         warn.append("한 번도 안 나온 사람: " + ", ".join(missing))
 
+    allcuts = [c for ch in out_chapters for c in ch["cuts"]]
+    groups = [c for c in allcuts if c["n"] > 1]
     plan = {"generated": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "title": notes.get("title", ""), "event": notes.get("event_name", ""),
             "target_sec": conf["target_sec"], "total_sec": round(t, 3),
-            "cuts": sum(len(c["cuts"]) for c in out_chapters),
+            "cuts": len(allcuts), "photos": sum(c["n"] for c in allcuts),
+            "grouped_cuts": len(groups), "grouped_photos": sum(c["n"] for c in groups),
+            "frame": {"width": frame[0], "height": frame[1],
+                      "max_upscale": conf["max_upscale"], "group_mode": conf["group_mode"]},
             "music": music, "beat_sec": round(beat, 4) if beat else 0,
             "chapters": out_chapters, "warnings": warn}
     save_json(PLAN_JSON, plan)
     _write_plan_md(plan)
 
     mm, ss = divmod(int(plan["total_sec"]), 60)
-    print(f"plan: {plan['cuts']}컷 / {mm}분 {ss}초  (목표 {conf['target_sec']}초)")
+    print(f"plan: {plan['cuts']}화면 / {plan['photos']}컷 / {mm}분 {ss}초  "
+          f"(목표 {conf['target_sec']}초)")
+    if groups:
+        print(f"  · {plan['grouped_photos']}장을 {len(groups)}개 화면에 나눠 담았습니다 "
+              f"(해상도·화면비 때문에 — {frame[0]}×{frame[1]}, 모드 {conf['group_mode']})")
     for c in out_chapters:
         print(f"  · {c['dur_sec']:>6.1f}초 {len(c['cuts']):>3}컷  {c['title']}"
               + (f"  [{c['dropped']}컷 뺌]" if c["dropped"] else ""))
@@ -1689,41 +1922,52 @@ def cmd_plan(args):
 
 
 def _most_redundant(keep) -> int:
-    """뺄 컷 고르기 — 우선순위가 낮고, 앞뒤 컷과 시간상 가장 붙어 있는 것."""
-    def ts(x):
+    """뺄 화면 고르기 — 우선순위가 낮고, 앞뒤와 시간상 가장 붙어 있는 것."""
+    def ts(u):
         try:
-            return dt.datetime.strptime(x[0]["taken_local"], "%Y-%m-%d %H:%M:%S").timestamp()
+            return dt.datetime.strptime(u["items"][0][0]["taken_local"],
+                                        "%Y-%m-%d %H:%M:%S").timestamp()
         except (ValueError, TypeError):
             return 0.0
 
     worst, worst_key = 0, None
-    for i, x in enumerate(keep):
-        gaps = [abs(ts(x) - ts(keep[j])) for j in (i - 1, i + 1) if 0 <= j < len(keep)]
-        key = (x[2], min(gaps) if gaps else 0.0)
+    for i, u in enumerate(keep):
+        gaps = [abs(ts(u) - ts(keep[j])) for j in (i - 1, i + 1) if 0 <= j < len(keep)]
+        key = (u["pick"], min(gaps) if gaps else 0.0)
         if worst_key is None or key < worst_key:
             worst, worst_key = i, key
     return worst
 
 
+LAYOUT_LABEL = {"full": "", "row2": "◫ 2장", "row3": "▥ 3장",
+                "col2": "⊟ 2장", "grid4": "▦ 4장"}
+
+
 def _write_plan_md(plan):
+    f = plan["frame"]
     L = [f"# {plan['title']} — {plan['event'] or '영상'} 계획", "",
-         f"- 총 {plan['cuts']}컷 / {int(plan['total_sec']) // 60}분 "
-         f"{int(plan['total_sec']) % 60}초 (목표 {plan['target_sec']}초)",
+         f"- 총 {plan['cuts']}화면 / 사진·영상 {plan['photos']}컷 / "
+         f"{int(plan['total_sec']) // 60}분 {int(plan['total_sec']) % 60}초 "
+         f"(목표 {plan['target_sec']}초)",
+         f"- 화면: {f['width']}×{f['height']} · 묶기 {f['group_mode']}"
+         + (f" · {plan['grouped_photos']}장을 {plan['grouped_cuts']}개 화면에 나눠 담음"
+            if plan["grouped_cuts"] else ""),
          f"- 음악: {plan['music']['file'] or '(미지정)'}"
          + (f" · BPM {plan['music']['bpm']} · 1박 {plan['beat_sec']}초" if plan["beat_sec"]
             else " · BPM 미지정"),
          f"- 생성: {plan['generated']}", ""]
     for c in plan["chapters"]:
         mm, ss = divmod(int(c["start_sec"]), 60)
-        L += [f"## {c['title']}  ({mm}:{ss:02d} ~ · {c['dur_sec']:.1f}초 · {len(c['cuts'])}컷)",
+        L += [f"## {c['title']}  ({mm}:{ss:02d} ~ · {c['dur_sec']:.1f}초 · {len(c['cuts'])}화면)",
               f"> {c['from']} ~ {c['to']}" + (f" · {c['mood']}" if c["mood"] else ""), "",
-              "| 시각 | 길이 | 자막 | 파일 |", "|---|---|---|---|"]
+              "| 시각 | 길이 | 화면 | 자막 | 파일 |", "|---|---|---|---|---|"]
         for cut in c["cuts"]:
             m2, s2 = divmod(int(cut["at"]), 60)
             mark = "★" if cut["pick"] == 2 else ""
             kind = "🎬" if cut["kind"] == "video" else ""
-            L.append(f"| {m2}:{s2:02d} | {cut['dur']:.1f}s | {mark}{kind} "
-                     f"{cut['caption'] or '_(없음)_'} | `{cut['file']}` |")
+            files = ", ".join(f"`{x['file']}`" for x in cut["tiles"])
+            L.append(f"| {m2}:{s2:02d} | {cut['dur']:.1f}s | {LAYOUT_LABEL.get(cut['layout'], '')}"
+                     f" | {mark}{kind} {cut['caption'] or '_(없음)_'} | {files} |")
         L.append("")
     if plan["warnings"]:
         L += ["## ⚠︎ 확인할 것", ""] + [f"- {w}" for w in plan["warnings"]] + [""]
@@ -1862,6 +2106,12 @@ def main():
     p.add_argument("--init", action="store_true", help="초안을 만들어 data/chapters.json 에 저장")
     p.add_argument("--count", type=int, default=6, help="챕터 개수 (기본 6)")
     p.add_argument("--target", type=int, help=f"영상 전체 목표 길이(초, 기본 {DEFAULT_TARGET_SEC})")
+    p.add_argument("--size", help="영상 해상도 (예: 1920x1080, 세로면 1080x1920)")
+    p.add_argument("--mode", choices=GROUP_MODES,
+                   help="여러 장을 한 화면에 묶기 — auto: 해상도 부족할 때만, "
+                        "fill: 화면에 안 맞는 세로 사진까지, off: 안 묶음")
+    p.add_argument("--max-upscale", type=float, dest="max_upscale",
+                   help=f"이 배율보다 크게 늘려야 하면 묶는다 (기본 {MAX_UPSCALE})")
     p.set_defaults(func=cmd_chapters)
 
     p = sub.add_parser("music", help="배경음악 BPM·첫 박·후렴 구간 설정")
@@ -2316,6 +2566,10 @@ body.onlyuntagged .shot:not(.untagged),body.onlyuntagged .day.hide{display:none}
         <li><b>영상 구간</b>(영상에서만) — 재생하다가 <code>I</code> 로 시작, <code>O</code> 로 끝을
             찍습니다. 안 잡으면 앞 6초만 씁니다. <code>M</code> 은 소리 — <b>아기 웃음·옹알이가
             든 컷은 소리를 살리고</b>, 그 구간만 배경음악을 줄이도록 계획에 표시됩니다.</li>
+        <li><b>한 화면에 몇 장</b> — 세로 사진을 가로 화면에 꽉 채우면 위아래가 크게 잘리고,
+            해상도가 모자란 사진은 늘려서 뿌옇게 됩니다. 그런 컷은 <b>2~4장을 한 화면에 나눠
+            담아</b> 스틸컷을 붙인 것처럼 보여줍니다(칸이 작아지니 늘릴 필요도 없고 덜 잘립니다).
+            자동 판단이 마음에 안 들면 <b>[◻ 단독으로]</b> 로 고정할 수 있습니다.</li>
         <li><code>N</code> 은 아직 안 고른 다음 사진, <code>←</code> <code>→</code> 는 이전·다음입니다.</li>
         </ul></dd>
     <dt>🎞 챕터·음악</dt>
@@ -2327,6 +2581,10 @@ body.onlyuntagged .shot:not(.untagged),body.onlyuntagged .day.hide{display:none}
             프로그램용)으로 내보냅니다.</li>
         <li>BPM 을 넣으면 컷이 <b>박자에 맞고</b>, 후렴 구간에서는 절반 길이로 몰아칩니다.
             영상은 다음 컷이 박에서 밀리지 않도록 뒤를 조금 채웁니다.</li>
+        <li><b>화면</b> — 해상도(가로 16:9 / 세로 9:16 …)와 <b>여러 장 묶기</b> 를 정합니다.
+            <code>해상도가 모자랄 때만</code>(기본)은 늘려야 뿌예지는 컷만 묶고,
+            <code>화면에 안 맞는 사진까지</code>는 <b>세로 사진도 2~3장씩 나란히</b> 넣어
+            화면을 채웁니다. ★ 꼭 으로 고른 컷은 묶지 않고 크게 보여줍니다.</li>
         <li>챕터 시간이 모자라면 <b>★ 꼭</b> 을 남기고 <b>같은 시간대에 몰린 컷부터</b> 뺍니다.
             무엇이 빠졌는지, 자막·얼굴 위치가 빠진 컷이 무엇인지 계획에 같이 적힙니다.</li>
         </ul>
@@ -2363,6 +2621,23 @@ body.onlyuntagged .shot:not(.untagged),body.onlyuntagged .day.hide{display:none}
     <button id="addChap">+ 챕터</button>
     <button id="draftChap" title="사진이 몰린 정도에 맞춰 자동으로 나눕니다">초안 만들기</button>
     <label>전체 목표 <input id="chapTarget" type="number" min="10" step="10"> 초</label>
+  </div>
+  <h4>화면</h4>
+  <div class="musicgrid">
+    <label>해상도
+      <select id="fSize">
+        <option value="1920x1080">가로 16:9 — 1920×1080</option>
+        <option value="3840x2160">가로 4K — 3840×2160</option>
+        <option value="1080x1920">세로 9:16 — 1080×1920</option>
+        <option value="1080x1080">정사각 — 1080×1080</option>
+      </select></label>
+    <label>여러 장 묶기
+      <select id="fMode">
+        <option value="auto">해상도가 모자랄 때만</option>
+        <option value="fill">화면에 안 맞는 사진까지 (세로 사진)</option>
+        <option value="off">안 묶음</option>
+      </select></label>
+    <label>최대 확대<input id="fUp" type="number" step="0.05" min="1" placeholder="1.15"></label>
   </div>
   <h4>음악</h4>
   <div class="musicgrid">
@@ -2416,6 +2691,9 @@ body.onlyuntagged .shot:not(.untagged),body.onlyuntagged .day.hide{display:none}
       </div>
       <div class="hint" id="focusHint"></div>
       <button class="linkbtn" id="clearFocusBtn" hidden>얼굴 위치 지우기</button>
+      <label>한 화면에 몇 장 <span class="keys">해상도·화면비로 자동 판단</span></label>
+      <div class="hint" id="fitHint"></div>
+      <button class="linkbtn" id="soloBtn"></button>
       <div class="row">
         <button id="privBtn" title="공유 번들·상영 화면에서 뺍니다">🔒 비공개</button>
         <button id="nextTagBtn" title="아직 고르지 않은 다음 사진으로">아직 안 고른 다음 →</button>
@@ -2703,6 +2981,7 @@ const tagOf=s=>({
   face:   s.dataset.face||'',
   people: s.dataset.ppl?s.dataset.ppl.split(','):[],
   short:  s.dataset.short||'',
+  solo:   s.dataset.solo==='1',
   tags:   s.dataset.tg?s.dataset.tg.split(','):[],
   clip:   s.dataset.clip?s.dataset.clip.split(',').map(Number):null,
   audio:  s.dataset.audio||'mute',
@@ -2720,7 +2999,7 @@ function paintShot(s){
   s.classList.add(t.pick===null?'untagged':'pick'+t.pick);
   s.classList.toggle('priv',t.priv);
   const marks=[t.pick===2?'★':t.pick===1?'·':t.pick===0?'✕':'', t.priv?'🔒':'',
-               t.focus?'◎':'', t.clip?'✂':'', t.audio==='keep'?'🔊':'',
+               t.focus?'◎':'', t.clip?'✂':'', t.audio==='keep'?'🔊':'', t.solo?'◻':'',
                t.people.length?`<em>${t.people.length}</em>`:''].filter(Boolean).join('');
   let el=s.querySelector('.tagmark');
   if(!marks){ if(el) el.remove(); return; }
@@ -2738,6 +3017,7 @@ function applyTag(s,patch){
   if('tags' in patch)    s.dataset.tg    = (patch.tags||[]).join(',');
   if('clip' in patch)    s.dataset.clip  = patch.clip?patch.clip.map(v=>+v.toFixed(2)).join(','):'';
   if('audio' in patch)   s.dataset.audio = patch.audio==='keep'?'keep':'';
+  if('solo' in patch)    s.dataset.solo  = patch.solo?'1':'';
   paintShot(s);
 }
 async function saveTag(patch,msg){
@@ -2775,7 +3055,32 @@ function renderTags(){
     ? `지정됨 — 가로 ${Math.round(t.focus[0]*100)}% · 세로 ${Math.round(t.focus[1]*100)}% (다시 클릭하면 옮깁니다)`
     : '사진에서 지호 얼굴을 클릭해 두면, 세로/가로 영상으로 자를 때 얼굴이 잘리지 않습니다';
   $('#clearFocusBtn').hidden=!t.focus;
+  renderFit(t);
   drawFocus();
+}
+// 이 사진을 화면에 꽉 채우면 얼마나 늘려야 하고 얼마나 잘리는지 —
+// 계획(plan)이 쓰는 것과 같은 계산이라 여기서 미리 보여준다
+function renderFit(t){
+  const d=shots[cur].dataset, w=+d.w||0, h=+d.h||0;
+  const W=CHAPS.width||1920, H=CHAPS.height||1080, MAX=CHAPS.max_upscale||1.15;
+  const mode=CHAPS.group_mode||'auto';
+  if(!w||!h){ $('#fitHint').textContent='크기를 알 수 없는 파일입니다';
+              $('#soloBtn').hidden=true; return; }
+  const s=Math.max(W/w,H/h), keep=Math.min(1,(W/s)/w)*Math.min(1,(H/s)/h);
+  const cut=Math.round((1-keep)*100), up=s.toFixed(2);
+  let why='';
+  if(d.kind==='video') why='';
+  else if(s>MAX) why=`해상도 부족 — ${up}배 늘려야 합니다`;
+  else if(mode==='fill'&&keep<0.45&&t.pick!==2) why=`꽉 채우면 ${cut}% 가 잘립니다`;
+  $('#fitHint').innerHTML = `원본 ${w}×${h} · 화면 ${W}×${H} 기준 `
+    + (s>1 ? `<b>${up}배 확대</b>` : `확대 없음`) + ` · ${cut}% 잘림`
+    + (t.solo ? ' — <b>단독 지정</b>'
+      : why ? ` → <b>다른 사진과 묶어 한 화면에</b> (${why})`
+            : ' — 한 화면에 단독으로 들어갑니다');
+  $('#soloBtn').hidden = d.kind==='video';
+  $('#soloBtn').textContent = t.solo
+    ? '◻ 단독 지정 해제 — 자동 판단에 맡기기'
+    : '◻ 이 사진은 묶지 말고 단독으로';
 }
 // 얼굴 위치 과녁을 사진 위 그 지점에 얹는다 (사진은 비율 유지라 매번 위치가 다르다)
 function drawFocus(){
@@ -2889,6 +3194,8 @@ $('#privBtn').onclick=()=>{const t=tagOf(shots[cur]);
   saveTag({private:!t.priv}, t.priv?'비공개 해제':'🔒 비공개 — 공유·영상에서 뺍니다');};
 $('#nextTagBtn').onclick=nextUntagged;
 $('#clearFocusBtn').onclick=()=>saveTag({focus:null},'얼굴 위치 지움');
+$('#soloBtn').onclick=()=>{const t=tagOf(shots[cur]);
+  saveTag({solo:!t.solo}, t.solo?'자동 판단':'◻ 단독으로 크게');};
 $('#clipIn').onclick=()=>setClipPoint('in');
 $('#clipOut').onclick=()=>setClipPoint('out');
 $('#clipPlay').onclick=playClip;
@@ -3057,9 +3364,18 @@ function renderChaps(){
     CHAPS.chapters=readChaps().filter((_,k)=>k!==+b.closest('.crow').dataset.i);
     renderChaps();
   });
+  $('#fSize').value=`${CHAPS.width||1920}x${CHAPS.height||1080}`;
+  if(!$('#fSize').value) $('#fSize').value='1920x1080';
+  $('#fMode').value=CHAPS.group_mode||'auto';
+  $('#fUp').value=CHAPS.max_upscale||1.15;
   $('#mFile').value=MUSIC.file||''; $('#mBpm').value=MUSIC.bpm||'';
   $('#mOff').value=MUSIC.offset||'';
   $('#mChorus').value=(MUSIC.sections||[]).map(s=>`${s.from}-${s.to}`).join(', ');
+}
+function readScreen(){
+  const [w,h]=($('#fSize').value||'1920x1080').split('x').map(Number);
+  return {width:w||1920, height:h||1080, group_mode:$('#fMode').value||'auto',
+          max_upscale:+$('#fUp').value||1.15};
 }
 function readChaps(){
   return [...$('#chapList').querySelectorAll('.crow')].map(r=>({
@@ -3092,12 +3408,14 @@ $('#draftChap').onclick=async()=>{
   catch(e){ say('실패: '+e.message,'err'); }
 };
 $('#saveChap').onclick=async()=>{
-  const body={target_sec:+$('#chapTarget').value||300, chapters:readChaps()};
+  const body={target_sec:+$('#chapTarget').value||300, chapters:readChaps(), ...readScreen()};
   MUSIC=readMusic();
   try{
     if(live){ await api('/api/chapters',body); await api('/api/music',MUSIC); }
     else { stash('__chapters__',body); stash('__music__',MUSIC); }
-    CHAPS=body; say('챕터·음악을 저장했습니다','ok');
+    CHAPS=body;
+    if(lb.classList.contains('on')) renderFit(tagOf(shots[cur]));   // 화면 설정이 바뀌었다
+    say('챕터·음악·화면 설정을 저장했습니다','ok');
   }catch(e){ say('저장 실패: '+e.message,'err'); }
 };
 $('#makePlan').onclick=async()=>{
@@ -3107,8 +3425,10 @@ $('#makePlan').onclick=async()=>{
   try{
     const j=await api('/api/plan',{with_untagged:$('#planAll').checked});
     const p=j.plan, mm=Math.floor(p.total_sec/60), ss=Math.round(p.total_sec%60);
-    box.innerHTML=`<div class="big">${p.cuts}컷 · ${mm}분 ${ss}초 <span style="opacity:.6">`
-      +`(목표 ${p.target_sec}초)</span></div>`
+    box.innerHTML=`<div class="big">${p.cuts}화면 · 사진·영상 ${p.photos}컷 · ${mm}분 ${ss}초 `
+      +`<span style="opacity:.6">(목표 ${p.target_sec}초)</span></div>`
+      +(p.grouped_cuts?`<p>${p.grouped_photos}장은 ${p.grouped_cuts}개 화면에 나눠 담았습니다 `
+        +`(${p.frame.width}×${p.frame.height} · 묶기 ${p.frame.group_mode})</p>`:'')
       +`<ul>${p.chapters.map(c=>`<li>${esc(c.title)} — ${c.dur_sec.toFixed(1)}초 · `
       +`${c.cuts.length}컷${c.dropped?` <span class="w">(${c.dropped}컷 뺌)</span>`:''}</li>`).join('')}</ul>`
       +(p.warnings.length?`<p class="w">⚠︎ 확인할 것 ${p.warnings.length}건</p><ul class="w">`
