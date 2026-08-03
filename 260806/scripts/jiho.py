@@ -530,8 +530,8 @@ def _render_segment(cut, duration, fade, dest, lyric="", caption_font="nanum_bru
             if sx2 - sx1 > .001 and sy2 - sy1 > .001:
                 chain.append(f"crop=iw*{sx2-sx1:.8f}:ih*{sy2-sy1:.8f}:"
                              f"iw*{sx1:.8f}:ih*{sy1:.8f}")
-        source_is_hdr = (tile.get("kind") != "image" and
-                         _video_color_info(path).get("is_hdr"))
+        source_info = (_video_color_info(path) if tile.get("kind") != "image" else {})
+        source_is_hdr = bool(source_info.get("is_hdr"))
         if not hdr and source_is_hdr:
             # Pixel/휴대폰 HLG·PQ 10비트 원본을 단순 8비트 변환하면 회색빛으로
             # 바랜다. 선형광에서 BT.2020→BT.709로 바꾸고 Mobius 톤매핑으로
@@ -586,10 +586,29 @@ def _render_segment(cut, duration, fade, dest, lyric="", caption_font="nanum_bru
                           "color_trc=arib-std-b67:colorspace=bt2020nc"]
             else:
                 # 사진·SDR 영상은 HDR 화면 안에서 원래 SDR 기준 밝기로 보이도록
-                # 선형광을 거쳐 HLG 작업 공간으로 올린다.
-                chain += ["setparams=range=limited:color_primaries=bt709:"
-                          "color_trc=bt709:colorspace=bt709",
+                # SDR reference white(100nit)를 HLG 1000nit 신호의 10% 선형광에
+                # 놓는다. full-range 영상은 full로 선언한 뒤 zscale이 실제로
+                # limited-range HLG로 바꾸게 해야 하이라이트가 들뜨거나 잘리지 않는다.
+                source_range = ("full" if (tile.get("kind") == "image" or
+                                           source_info.get("color_range") == "pc")
+                                else "limited")
+                supported_primaries = {"bt709", "bt470bg", "smpte170m"}
+                supported_transfers = {"bt709", "smpte170m"}
+                supported_matrices = {"bt709", "bt470bg", "smpte170m"}
+                source_primaries = str(source_info.get("color_primaries") or "bt709")
+                source_transfer = str(source_info.get("color_transfer") or "bt709")
+                source_matrix = str(source_info.get("color_space") or "bt709")
+                if source_primaries not in supported_primaries:
+                    source_primaries = "bt709"
+                if source_transfer not in supported_transfers:
+                    source_transfer = "bt709"
+                if source_matrix not in supported_matrices:
+                    source_matrix = "bt709"
+                chain += [f"setparams=range={source_range}:"
+                          f"color_primaries={source_primaries}:"
+                          f"color_trc={source_transfer}:colorspace={source_matrix}",
                           "zscale=t=linear:npl=100", "format=gbrpf32le",
+                          "lutrgb=r='val*0.1':g='val*0.1':b='val*0.1'",
                           "zscale=t=arib-std-b67:p=bt2020:m=bt2020nc:"
                           "r=tv:npl=1000:d=error_diffusion",
                           "format=yuv420p10le"]
