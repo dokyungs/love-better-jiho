@@ -240,6 +240,7 @@ RENDER_TARGET_BYTES = 45_000_000
 RENDER_MAX_VIDEO_BPS = 800_000
 RENDER_AUDIO_BPS = 64_000
 RENDER_SEGMENT_CRF = 21
+RENDER_HDR = False
 RENDER_PRESETS = {
     "low": {"label": "저용량", "width": 640, "height": 360, "fps": 15,
             "limit": 50_000_000, "target": 45_000_000, "max_bps": 800_000,
@@ -275,6 +276,38 @@ RENDER_FONT_STYLES = {
     "apple_gothic": {"size": 23, "wrap": 26, "line_spacing": 4, "border": 0},
 }
 _caption_measure_cache = {}
+CAPTION_DELAY_RE = re.compile(r"<\s*(\d+(?:\.\d+)?)\s*s\s*>", re.IGNORECASE)
+CAPTION_FADE_SECONDS = .4
+
+
+def _caption_cue_chars(text):
+    """자막을 `(문자, 섹션 시작 기준 표시 시각)` 목록의 줄들로 파싱한다."""
+    delay, lines, cursor = 0.0, [[]], 0
+
+    def append(raw):
+        nonlocal lines
+        for char in raw:
+            if char == "\n":
+                lines.append([])
+            elif char != "\r":
+                lines[-1].append((char, delay))
+
+    raw = str(text or "")
+    for match in CAPTION_DELAY_RE.finditer(raw):
+        append(raw[cursor:match.start()])
+        delay = max(0.0, min(3600.0, float(match.group(1))))
+        cursor = match.end()
+    append(raw[cursor:])
+    return lines
+
+
+def _wrap_caption_cues(text, font, style, max_width):
+    """시간 정보를 보존하되 사용자가 직접 넣은 줄바꿈만 유지한다."""
+    return _caption_cue_chars(text) or [[]]
+
+
+def _strip_caption_delays(text):
+    return CAPTION_DELAY_RE.sub("", str(text or "")).strip()
 
 
 def _wrap_caption(text, font, style, max_width):
@@ -365,11 +398,11 @@ def render_status():
         return {"ok": True, **_render_status}
 
 
-def _select_render_preset(name):
+def _select_render_preset(name, hdr=False):
     """단일 렌더 작업이 사용할 해상도·프레임률·용량 목표를 설정한다."""
     global RENDER_OUTPUT, RENDER_WIDTH, RENDER_HEIGHT, RENDER_FPS
     global RENDER_LIMIT_BYTES, RENDER_TARGET_BYTES, RENDER_MAX_VIDEO_BPS
-    global RENDER_AUDIO_BPS, RENDER_SEGMENT_CRF
+    global RENDER_AUDIO_BPS, RENDER_SEGMENT_CRF, RENDER_HDR
     name = str(name or "low").lower()
     if name not in RENDER_PRESETS:
         name = "low"
@@ -379,7 +412,11 @@ def _select_render_preset(name):
     RENDER_LIMIT_BYTES, RENDER_TARGET_BYTES = preset["limit"], preset["target"]
     RENDER_MAX_VIDEO_BPS = preset["max_bps"]
     RENDER_AUDIO_BPS, RENDER_SEGMENT_CRF = preset["audio_bps"], preset["crf"]
-    RENDER_OUTPUT = RENDER_DIR / preset["output"]
+    RENDER_HDR = bool(hdr)
+    output_name = preset["output"]
+    if RENDER_HDR:
+        output_name = output_name.removesuffix(".mp4") + "-hdr.mp4"
+    RENDER_OUTPUT = RENDER_DIR / output_name
     return name, preset
 
 
@@ -406,13 +443,54 @@ def _tile_box(cell):
     return x1, y1, max(2, x2 - x1), max(2, y2 - y1)
 
 
+def _grid_cells(count, requested_columns=None):
+    """16:9 화면에서 각 칸이 지나치게 납작하지 않도록 자동 열·행을 계산한다."""
+    count = max(1, int(count or 1))
+    auto_columns = max(1, int(math.ceil(math.sqrt(count * 16 / 9))))
+    try:
+        columns = max(1, min(count, int(requested_columns or auto_columns)))
+    except (TypeError, ValueError):
+        columns = auto_columns
+    rows = max(1, int(math.ceil(count / columns)))
+    return columns, rows, [
+        [(i % columns) / columns, (i // columns) / rows, 1 / columns, 1 / rows]
+        for i in range(count)
+    ]
+
+
 def _rotation_filter(rotation):
     return {90: "transpose=clock", 180: "hflip,vflip",
             270: "transpose=cclock"}.get(int(rotation or 0) % 360, "")
 
 
+_video_color_cache = {}
+
+
+def _video_color_info(path):
+    """원본 영상의 색공간을 읽어 HDR 영상만 선택적으로 톤매핑한다."""
+    key = str(path)
+    if key in _video_color_cache:
+        return _video_color_cache[key]
+    result = subprocess.run(
+        [FFPROBE_BIN, "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=pix_fmt,color_range,color_space,color_transfer,color_primaries",
+         "-of", "json", str(path)], stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL, text=True)
+    try:
+        stream = (json.loads(result.stdout or "{}").get("streams") or [{}])[0]
+    except (json.JSONDecodeError, IndexError, TypeError):
+        stream = {}
+    transfer = str(stream.get("color_transfer") or "").lower()
+    primaries = str(stream.get("color_primaries") or "").lower()
+    pix_fmt = str(stream.get("pix_fmt") or "").lower()
+    stream["is_hdr"] = (transfer in {"arib-std-b67", "smpte2084"} or
+                        (primaries == "bt2020" and ("10" in pix_fmt or "12" in pix_fmt)))
+    _video_color_cache[key] = stream
+    return stream
+
+
 def _render_segment(cut, duration, fade, dest, lyric="", caption_font="nanum_brush",
-                    caption_position=None):
+                    caption_position=None, caption_elapsed=0.0, hdr=False):
     """컷 하나를 선택한 16:9 렌더 프레임으로 정규화한다."""
     segment_duration = float(duration) + float(fade)
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
@@ -432,7 +510,13 @@ def _render_segment(cut, duration, fade, dest, lyric="", caption_font="nanum_bru
             start = max(0.0, float(clip[0] or 0))
             cmd += ["-ss", f"{start:.3f}", "-i", str(path)]
 
-    filters = ["[0:v]format=yuv420p[base0]"]
+    pixel_format = "yuv420p10le" if hdr else "yuv420p"
+    color_tag = ("setparams=range=limited:color_primaries=bt2020:"
+                 "color_trc=arib-std-b67:colorspace=bt2020nc"
+                 if hdr else
+                 "setparams=range=limited:color_primaries=bt709:"
+                 "color_trc=bt709:colorspace=bt709")
+    filters = [f"[0:v]format={pixel_format},{color_tag}[base0]"]
     base = "base0"
     for i, tile in enumerate(cut.get("tiles") or [], 1):
         x, y, width, height = _tile_box(tile.get("cell") or [0, 0, 1, 1])
@@ -446,9 +530,20 @@ def _render_segment(cut, duration, fade, dest, lyric="", caption_font="nanum_bru
             if sx2 - sx1 > .001 and sy2 - sy1 > .001:
                 chain.append(f"crop=iw*{sx2-sx1:.8f}:ih*{sy2-sy1:.8f}:"
                              f"iw*{sx1:.8f}:ih*{sy1:.8f}")
-        if tile.get("kind") == "image" and tile.get("effect") == "zoom_in":
+        source_is_hdr = (tile.get("kind") != "image" and
+                         _video_color_info(path).get("is_hdr"))
+        if not hdr and source_is_hdr:
+            # Pixel/휴대폰 HLG·PQ 10비트 원본을 단순 8비트 변환하면 회색빛으로
+            # 바랜다. 선형광에서 BT.2020→BT.709로 바꾸고 Mobius 톤매핑으로
+            # 중간 색상과 피부색을 최대한 보존한 뒤 SDR limited-range로 내린다.
+            chain += ["zscale=t=linear:npl=203", "format=gbrpf32le",
+                      "zscale=p=bt709", "tonemap=tonemap=mobius:param=0.3:desat=2",
+                      "zscale=t=bt709:m=bt709:r=tv:d=error_diffusion",
+                      "format=yuv420p"]
+        if tile.get("kind") == "image" and tile.get("effect") in ("zoom_in", "zoom_in_12"):
             frames = max(2, int(round(segment_duration * RENDER_FPS)))
-            inset = .5 * (1 - 1 / 1.06)
+            zoom_factor = 1.12 if tile.get("effect") == "zoom_in_12" else 1.06
+            inset = .5 * (1 - 1 / zoom_factor)
             progress = f"min(on/{frames - 1},1)"
             # 원본 픽셀을 정수 좌표로 잘라 옮기는 zoompan 대신, 원본 해상도의
             # 네 모서리를 부동소수점 좌표로 매 프레임 변환한다. cubic 보간 후
@@ -477,12 +572,34 @@ def _render_segment(cut, duration, fade, dest, lyric="", caption_font="nanum_bru
                       f"(oh-ih)*{media_y:.4f}:black"]
         chain += ["setsar=1", f"fps={RENDER_FPS}",
                   f"tpad=stop_mode=clone:stop_duration={segment_duration:.3f}",
-                  f"trim=duration={segment_duration:.3f}", "format=yuv420p"]
+                  f"trim=duration={segment_duration:.3f}"]
+        if tile.get("reveal_at") is not None:
+            reveal_at = max(0.0, float(tile.get("reveal_at") or 0))
+            reveal_fade = max(.05, float(tile.get("reveal_fade") or .4))
+            chain.append(f"fade=t=in:st={reveal_at:.3f}:d={reveal_fade:.3f}")
+        if hdr:
+            if source_is_hdr:
+                # HLG 원본은 밝기나 색역을 SDR로 내리지 않는다. 공간 변환 뒤에도
+                # 원래의 10비트 BT.2020 HLG 신호로 유지해 휴대폰 HDR 표시 경로를 탄다.
+                chain += ["format=yuv420p10le",
+                          "setparams=range=limited:color_primaries=bt2020:"
+                          "color_trc=arib-std-b67:colorspace=bt2020nc"]
+            else:
+                # 사진·SDR 영상은 HDR 화면 안에서 원래 SDR 기준 밝기로 보이도록
+                # 선형광을 거쳐 HLG 작업 공간으로 올린다.
+                chain += ["setparams=range=limited:color_primaries=bt709:"
+                          "color_trc=bt709:colorspace=bt709",
+                          "zscale=t=linear:npl=100", "format=gbrpf32le",
+                          "zscale=t=arib-std-b67:p=bt2020:m=bt2020nc:"
+                          "r=tv:npl=1000:d=error_diffusion",
+                          "format=yuv420p10le"]
+        else:
+            chain.append("format=yuv420p")
         filters.append(f"[{i}:v]{','.join(chain)}[tile{i}]")
         out = f"base{i}"
         filters.append(f"[{base}][tile{i}]overlay={x}:{y}:shortest=1[{out}]")
         base = out
-    clean_lyric = str(lyric or "").strip()
+    clean_lyric = _strip_caption_delays(lyric)
     if clean_lyric and clean_lyric != "가사 없음":
         style = dict(RENDER_FONT_STYLES.get(
             str(caption_font), RENDER_FONT_STYLES["nanum_brush"]))
@@ -492,34 +609,92 @@ def _render_segment(cut, duration, fade, dest, lyric="", caption_font="nanum_bru
         font = RENDER_FONTS.get(str(caption_font), RENDER_FONTS["maru_buri"])
         if not font.is_file():
             font = RENDER_FONTS["nanum_pen"]
-        lyric_file = dest.with_suffix(".lyric.txt")
-        lyric_lines = _wrap_caption(clean_lyric, font, style, int(RENDER_WIDTH * .92))
-        wrapped_lyric = "\n".join(lyric_lines)
-        lyric_file.write_text(wrapped_lyric, encoding="utf-8")
+        # 자동 줄바꿈은 하지 않는다. 사용자가 Enter를 넣지 않은 긴 줄은
+        # 해당 자막의 글자 크기만 줄여 화면 너비 92% 안에 맞춘다.
+        max_caption_width = int(RENDER_WIDTH * .92)
+        manual_lines = _strip_caption_delays(lyric).splitlines() or [""]
+        widest = max((_measure_caption_box(line or " ", font, style)[0]
+                      for line in manual_lines), default=0)
+        if widest > max_caption_width:
+            shrink = max(.45, max_caption_width / widest)
+            style["size"] = max(1, int(math.floor(style["size"] * shrink)))
+            style["line_spacing"] = max(1, int(round(style["line_spacing"] * shrink)))
+        cue_lines = _wrap_caption_cues(lyric, font, style, int(RENDER_WIDTH * .92))
+        wrapped_lyric = "\n".join("".join(char for char, _delay in line)
+                                  for line in cue_lines)
         try:
             pos_x, pos_y = [float(v) for v in (caption_position or [.5, .86])[:2]]
         except (TypeError, ValueError):
             pos_x, pos_y = .5, .86
         pos_x, pos_y = max(.0, min(1., pos_x)), max(.0, min(1., pos_y))
-        measured_width, _measured_height = _measure_caption_box(wrapped_lyric, font, style)
-        box_width = max(2, min(int(RENDER_WIDTH * .92), measured_width))
-        x_expr = f"max(0,min(w-{box_width},w*{pos_x:.4f}-{box_width / 2:.1f}))"
-        y_expr = f"max(0,min(h-text_h,h*{pos_y:.4f}-text_h/2))"
+        _measured_width, measured_height = _measure_caption_box(wrapped_lyric, font, style)
+        top_expr = (f"max(0,min(h-{measured_height},"
+                    f"h*{pos_y:.4f}-{measured_height / 2:.1f}))")
         filters.append(f"[{base}]trim=duration={segment_duration:.3f},"
-                       "setpts=PTS-STARTPTS,format=yuv420p[captionbase]")
-        filters.append(f"[captionbase]drawtext=fontfile='{font}':textfile='{lyric_file}':"
-                       f"fontcolor=white:fontsize={style['size']}:line_spacing={style['line_spacing']}:"
-                       f"boxw={box_width}:text_align=C:x='{x_expr}':y='{y_expr}':"
-                       f"fix_bounds=true:borderw={style['border']}:bordercolor=black@0:"
-                       f"shadowx={max(1, round(font_scale))}:"
-                       f"shadowy={max(1, round(2 * font_scale))}:"
-                       "shadowcolor=black@.70[outv]")
+                       f"setpts=PTS-STARTPTS,format={pixel_format},"
+                       f"{color_tag}[captionbase]")
+        draw_chunks = []
+        for line_i, cue_chars in enumerate(cue_lines):
+            full_line = "".join(char for char, _delay in cue_chars)
+            line_width = max(2, min(int(RENDER_WIDTH * .92),
+                                    _measure_caption_box(full_line or " ", font, style)[0]))
+            start = 0
+            while start < len(cue_chars):
+                cue_delay = cue_chars[start][1]
+                end = start + 1
+                while end < len(cue_chars) and abs(cue_chars[end][1] - cue_delay) < .0001:
+                    end += 1
+                chunk_text = "".join(char for char, _delay in cue_chars[start:end])
+                prefix = "".join(char for char, _delay in cue_chars[:start])
+                prefix_width = (_measure_caption_box(prefix, font, style)[0] if prefix else 0)
+                if chunk_text.strip():
+                    draw_chunks.append((cue_delay, line_i, chunk_text,
+                                        line_width, prefix_width))
+                start = end
+        previous = "captionbase"
+        line_height = style["size"] + style["line_spacing"]
+        for group_i, (cue_delay, line_i, chunk_text, line_width, prefix_width) in enumerate(
+                draw_chunks):
+            lyric_file = dest.with_suffix(f".lyric-{group_i}.txt")
+            lyric_file.write_text(chunk_text, encoding="utf-8")
+            chunk_width = max(2, _measure_caption_box(chunk_text, font, style)[0])
+            line_left = (f"max(0,min(w-{line_width},"
+                         f"w*{pos_x:.4f}-{line_width / 2:.1f}))")
+            x_expr = f"({line_left})+{prefix_width}"
+            y_expr = f"({top_expr})+{line_i * line_height}"
+            # caption_elapsed는 현재 슬라이드가 섹션 안에서 시작하는 시각이다.
+            # 따라서 사진이 바뀌어도 줄별 지연이 다시 시작되지 않는다.
+            fade_start = cue_delay - max(0.0, float(caption_elapsed or 0))
+            alpha_expr = (f"clip((t-({fade_start:.6f}))/{CAPTION_FADE_SECONDS:.3f},0,1)"
+                          if fade_start > -CAPTION_FADE_SECONDS else "1")
+            output = "outv" if group_i == len(draw_chunks) - 1 else f"caption{group_i + 1}"
+            filters.append(f"[{previous}]drawtext=fontfile='{font}':textfile='{lyric_file}':"
+                           f"fontcolor=white:fontsize={style['size']}:"
+                           f"line_spacing={style['line_spacing']}:boxw={chunk_width}:"
+                           f"text_align=L:x='{x_expr}':y='{y_expr}':alpha='{alpha_expr}':"
+                           f"fix_bounds=true:borderw={style['border']}:bordercolor=black@0:"
+                           f"shadowx={max(1, round(font_scale))}:"
+                           f"shadowy={max(1, round(2 * font_scale))}:"
+                           f"shadowcolor=black@.70[{output}]")
+            previous = output
     else:
         filters.append(f"[{base}]trim=duration={segment_duration:.3f},"
-                       f"setpts=PTS-STARTPTS,format=yuv420p[outv]")
+                       f"setpts=PTS-STARTPTS,format={pixel_format},"
+                       f"{color_tag}[outv]")
     cmd += ["-filter_complex", ";".join(filters), "-map", "[outv]", "-an",
-            "-r", str(RENDER_FPS), "-c:v", "libx264", "-preset", "ultrafast",
-            "-crf", str(RENDER_SEGMENT_CRF), "-pix_fmt", "yuv420p", str(dest)]
+            "-r", str(RENDER_FPS)]
+    if hdr:
+        cmd += ["-c:v", "libx265", "-preset", "ultrafast", "-crf", "18",
+                "-pix_fmt", "yuv420p10le", "-tag:v", "hvc1",
+                "-color_range", "tv", "-colorspace", "bt2020nc",
+                "-color_primaries", "bt2020", "-color_trc", "arib-std-b67",
+                "-x265-params", "hdr-opt=1:repeat-headers=1"]
+    else:
+        cmd += ["-c:v", "libx264", "-preset", "ultrafast",
+                "-crf", str(RENDER_SEGMENT_CRF), "-pix_fmt", "yuv420p",
+                "-color_range", "tv", "-colorspace", "bt709",
+                "-color_primaries", "bt709", "-color_trc", "bt709"]
+    cmd.append(str(dest))
     _ffmpeg(cmd, f"{cut.get('file') or '슬라이드'} 변환")
 
 
@@ -557,7 +732,7 @@ def _measure_loudness(path, start, duration):
 
 
 def _xfade_files(paths, durations, fade, dest, final=False, music=None, total=None,
-                 audio_events=None, music_volume=1.0, source_volume=.70):
+                 audio_events=None, music_volume=1.0, source_volume=.70, hdr=False):
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
     for path in paths:
         cmd += ["-i", str(path)]
@@ -571,10 +746,11 @@ def _xfade_files(paths, durations, fade, dest, final=False, music=None, total=No
         cmd += ["-ss", f"{event['source_start']:.3f}", "-t", f"{event['duration']:.3f}",
                 "-i", str(event["path"])]
         audio_inputs.append((input_i, event))
+    pixel_format = "yuv420p10le" if hdr else "yuv420p"
     if len(paths) == 1:
         parts = [f"[0:v]setpts=PTS-STARTPTS,tpad=stop_mode=clone:"
                  f"stop_duration={float(durations[0]):.3f},"
-                 f"trim=duration={float(durations[0]):.3f},format=yuv420p[vout]"]
+                 f"trim=duration={float(durations[0]):.3f},format={pixel_format}[vout]"]
     else:
         parts, offset = [], 0.0
         # 중간 묶음 파일이 인코더 타임베이스 때문에 몇 프레임 짧아져도
@@ -585,7 +761,7 @@ def _xfade_files(paths, durations, fade, dest, final=False, music=None, total=No
             label = f"vin{i}"
             parts.append(f"[{i}:v]setpts=PTS-STARTPTS,tpad=stop_mode=clone:"
                          f"stop_duration={expected:.3f},trim=duration={expected:.3f},"
-                         f"format=yuv420p[{label}]")
+                         f"format={pixel_format}[{label}]")
             normalized.append(label)
         previous = normalized[0]
         for i in range(1, len(paths)):
@@ -630,7 +806,13 @@ def _xfade_files(paths, durations, fade, dest, final=False, music=None, total=No
     elif music_index is not None:
         parts.append("[music]alimiter=limit=.95[aout]")
         audio_output = "aout"
-    cmd += ["-filter_complex", ";".join(parts), "-map", "[vout]"]
+    if hdr:
+        parts.append("[vout]setparams=range=limited:color_primaries=bt2020:"
+                     "color_trc=arib-std-b67:colorspace=bt2020nc[vtagged]")
+    else:
+        parts.append("[vout]setparams=range=limited:color_primaries=bt709:"
+                     "color_trc=bt709:colorspace=bt709[vtagged]")
+    cmd += ["-filter_complex", ";".join(parts), "-map", "[vtagged]"]
     if audio_output:
         cmd += ["-map", f"[{audio_output}]", "-c:a", "aac", "-b:a", str(RENDER_AUDIO_BPS)]
     else:
@@ -640,14 +822,34 @@ def _xfade_files(paths, durations, fade, dest, final=False, music=None, total=No
         video_bps = int(max(160_000, min(RENDER_MAX_VIDEO_BPS,
             ((RENDER_TARGET_BYTES * 8 / total) -
              (RENDER_AUDIO_BPS if audio_output else 0)) * .95)))
-        cmd += ["-t", f"{total:.3f}", "-c:v", "libx264", "-preset", "veryfast",
-                "-b:v", str(video_bps), "-maxrate", str(int(video_bps * 1.25)),
-                "-bufsize", str(video_bps * 2), "-pix_fmt", "yuv420p",
-                "-movflags", "+faststart", str(dest)]
+        cmd += ["-t", f"{total:.3f}"]
+        if hdr:
+            cmd += ["-c:v", "libx265", "-preset", "fast",
+                    "-b:v", str(video_bps), "-maxrate", str(int(video_bps * 1.25)),
+                    "-bufsize", str(video_bps * 2), "-pix_fmt", "yuv420p10le",
+                    "-tag:v", "hvc1", "-color_range", "tv", "-colorspace", "bt2020nc",
+                    "-color_primaries", "bt2020", "-color_trc", "arib-std-b67",
+                    "-x265-params", "hdr-opt=1:repeat-headers=1"]
+        else:
+            cmd += ["-c:v", "libx264", "-preset", "veryfast",
+                    "-b:v", str(video_bps), "-maxrate", str(int(video_bps * 1.25)),
+                    "-bufsize", str(video_bps * 2), "-pix_fmt", "yuv420p",
+                    "-color_range", "tv", "-colorspace", "bt709",
+                    "-color_primaries", "bt709", "-color_trc", "bt709"]
+        cmd += ["-movflags", "+faststart", str(dest)]
     else:
-        cmd += ["-c:v", "libx264", "-preset", "ultrafast",
-                "-crf", str(RENDER_SEGMENT_CRF),
-                "-pix_fmt", "yuv420p", str(dest)]
+        if hdr:
+            cmd += ["-c:v", "libx265", "-preset", "ultrafast", "-crf", "18",
+                    "-pix_fmt", "yuv420p10le", "-tag:v", "hvc1",
+                    "-color_range", "tv", "-colorspace", "bt2020nc",
+                    "-color_primaries", "bt2020", "-color_trc", "arib-std-b67",
+                    "-x265-params", "hdr-opt=1:repeat-headers=1", str(dest)]
+        else:
+            cmd += ["-c:v", "libx264", "-preset", "ultrafast",
+                    "-crf", str(RENDER_SEGMENT_CRF),
+                    "-pix_fmt", "yuv420p", "-color_range", "tv",
+                    "-colorspace", "bt709", "-color_primaries", "bt709",
+                    "-color_trc", "bt709", str(dest)]
     _ffmpeg(cmd, "크로스페이드 합성")
 
 
@@ -655,7 +857,8 @@ def _preview_render_worker(render_options=None):
     work = None
     try:
         render_options = render_options or {}
-        quality, preset = _select_render_preset(render_options.get("quality"))
+        hdr = bool(render_options.get("hdr", True))
+        quality, preset = _select_render_preset(render_options.get("quality"), hdr=hdr)
         music_volume = max(0.0, min(2.0, float(render_options.get("music_volume", 1.0))))
         source_volume = max(0.0, min(2.0, float(render_options.get("source_volume", .70))))
         caption_font = str(render_options.get("caption_font") or "nanum_brush")
@@ -666,7 +869,9 @@ def _preview_render_worker(render_options=None):
         cut_by_key = {"|".join(tile["file"] for tile in cut.get("tiles", [])): cut
                       for cut in all_cuts}
         render_sections = plan.get("render_sections") or []
-        caption_positions = ((plan.get("plot_layout") or {}).get("caption_positions") or {})
+        plot_layout = plan.get("plot_layout") or {}
+        caption_positions = plot_layout.get("caption_positions") or {}
+        section_effects = plot_layout.get("section_effects") or {}
         render_items, used_keys, black_seconds = [], [], 0.0
         if render_sections:
             for section in render_sections:
@@ -675,6 +880,38 @@ def _preview_render_worker(render_options=None):
                 lyric = str(section.get("lyric") or "")
                 section_id = str(section.get("id") or "")
                 section_caption_position = caption_positions.get(f"section:{section_id}")
+                section_effect = section.get("effect") or section_effects.get(section_id) or {}
+                if section_effect.get("type") == "grid_rows" and budget >= 1 / RENDER_FPS:
+                    grid_tiles, grid_keys = [], []
+                    for key in section.get("keys") or []:
+                        source_cut = cut_by_key.get(key)
+                        if not source_cut:
+                            continue
+                        grid_keys.append(key)
+                        for tile in source_cut.get("tiles") or []:
+                            grid_tiles.append(dict(tile))
+                    if grid_tiles:
+                        columns, rows, cells = _grid_cells(
+                            len(grid_tiles), section_effect.get("columns"))
+                        reveal_seconds = max(.1, min(
+                            budget, float(section_effect.get("seconds") or budget)))
+                        row_interval = reveal_seconds / rows
+                        reveal_fade = min(.65, max(.15, row_interval * .65))
+                        for tile_i, (tile, cell) in enumerate(zip(grid_tiles, cells)):
+                            tile["cell"] = cell
+                            tile["fit"] = "cover"
+                            tile["effect"] = "none"
+                            tile["reveal_at"] = (tile_i // columns) * row_interval
+                            tile["reveal_fade"] = reveal_fade
+                            tile["grid_mute"] = True
+                        grid_cut = {"file": f"행 그리드 · {section.get('title')}",
+                                    "tiles": grid_tiles,
+                                    "caption_position": section_caption_position,
+                                    "grid": {"columns": columns, "rows": rows,
+                                             "seconds": reveal_seconds}}
+                        render_items.append((grid_cut, budget, section_id, lyric, 0.0))
+                        used_keys.extend(grid_keys)
+                        continue
                 spent = 0.0
                 for key in section.get("keys") or []:
                     cut = cut_by_key.get(key)
@@ -687,7 +924,7 @@ def _preview_render_worker(render_options=None):
                     cut = dict(cut)
                     if section_caption_position:
                         cut["caption_position"] = section_caption_position
-                    render_items.append((cut, duration, section_id, lyric))
+                    render_items.append((cut, duration, section_id, lyric, spent))
                     used_keys.append(key)
                     spent += duration
                 gap = max(0.0, budget - spent)
@@ -695,19 +932,20 @@ def _preview_render_worker(render_options=None):
                     render_items.append(({"file": f"검은 화면 · {section.get('title')}",
                                           "tiles": [],
                                           "caption_position": section_caption_position}, gap,
-                                         section_id, lyric))
+                                         section_id, lyric, spent))
                     black_seconds += gap
         else:
             for key in plan.get("render_keys") or []:
                 if key in cut_by_key:
                     cut = cut_by_key[key]
-                    render_items.append((cut, max(.2, float(cut.get("dur") or 0)), "", ""))
+                    render_items.append((cut, max(.2, float(cut.get("dur") or 0)), "", "", 0.0))
                     used_keys.append(key)
         if not render_items:
             raise RuntimeError("왼쪽 콘티에 배치된 슬라이드가 없습니다")
         cuts = [item[0] for item in render_items]
         durations = [item[1] for item in render_items]
         lyrics_for_items = [item[3] for item in render_items]
+        caption_elapsed_for_items = [item[4] for item in render_items]
         # 기존 전환보다 50% 길게: 사진이 동시에 사라지고 나타나는 여운을
         # 조금 더 주되, 아주 짧은 슬라이드에서는 길이의 67.5%를 넘지 않는다.
         fade = min(.525, max(.12, min(durations) * .675)) if len(cuts) > 1 else 0.0
@@ -721,12 +959,15 @@ def _preview_render_worker(render_options=None):
                            done=0,
                            total=len(cuts) + math.ceil(len(cuts) / 32) + 1,
                            quality=quality, quality_label=preset["label"],
-                           width=RENDER_WIDTH, height=RENDER_HEIGHT, fps=RENDER_FPS)
-        for i, (cut, dur, lyric) in enumerate(zip(cuts, durations, lyrics_for_items)):
+                           width=RENDER_WIDTH, height=RENDER_HEIGHT, fps=RENDER_FPS,
+                           hdr=hdr)
+        for i, (cut, dur, lyric, caption_elapsed) in enumerate(
+                zip(cuts, durations, lyrics_for_items, caption_elapsed_for_items)):
             path = work / f"segment-{i:04d}.mp4"
             _render_segment(cut, dur, fade if i < len(cuts) - 1 else 0.0, path, lyric,
                             caption_font=caption_font,
-                            caption_position=cut.get("caption_position"))
+                            caption_position=cut.get("caption_position"),
+                            caption_elapsed=caption_elapsed, hdr=hdr)
             segments.append(path)
             _set_render_status(done=i + 1,
                                message=f"슬라이드 변환 중 · {i + 1}/{len(cuts)}")
@@ -736,7 +977,7 @@ def _preview_render_worker(render_options=None):
             group_paths = segments[start:start + 32]
             group_durs = durations[start:start + 32]
             chunk = work / f"chunk-{group_i:03d}.mp4"
-            _xfade_files(group_paths, group_durs, fade, chunk)
+            _xfade_files(group_paths, group_durs, fade, chunk, hdr=hdr)
             chunks.append(chunk)
             chunk_durations.append(sum(group_durs))
             _set_render_status(done=len(cuts) + group_i + 1,
@@ -753,7 +994,8 @@ def _preview_render_worker(render_options=None):
                 is_live_photo = kind == "motion" or ".LS." in file_name.upper()
                 # 일반 동영상은 원음을 기본으로 살린다. 갤러리에서 명시적으로
                 # mute한 것만 빼고, 라이브/모션 포토는 명시적 keep이 없으면 무음이다.
-                if (kind not in ("video", "motion") or explicit_audio == "mute" or
+                if (tile.get("grid_mute") or kind not in ("video", "motion") or
+                        explicit_audio == "mute" or
                         (is_live_photo and explicit_audio != "keep")):
                     continue
                 source = ROOT / str(tile.get("path") or "")
@@ -779,17 +1021,27 @@ def _preview_render_worker(render_options=None):
         _xfade_files(chunks, chunk_durations, fade, temp_output, final=True,
                      music=music_path if music_path.is_file() else None, total=total,
                      audio_events=audio_events, music_volume=music_volume,
-                     source_volume=source_volume)
+                     source_volume=source_volume, hdr=hdr)
         if temp_output.stat().st_size > RENDER_LIMIT_BYTES:
             smaller = work / "preview-smaller.mp4"
             bps = max(120_000, int(
                 ((RENDER_LIMIT_BYTES * 8 / max(.2, total)) -
                  (RENDER_AUDIO_BPS if audio_events or music_path.is_file() else 0)) * .92))
-            _ffmpeg(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                     "-i", str(temp_output), "-c:v", "libx264", "-preset", "veryfast",
-                     "-b:v", str(bps), "-maxrate", str(int(bps * 1.2)),
-                     "-bufsize", str(bps * 2), "-c:a", "copy", "-movflags", "+faststart",
-                     str(smaller)], f"{preset['label']} 용량 재압축")
+            recompress = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                          "-i", str(temp_output)]
+            if hdr:
+                recompress += ["-c:v", "libx265", "-preset", "fast",
+                               "-pix_fmt", "yuv420p10le", "-tag:v", "hvc1",
+                               "-color_range", "tv", "-colorspace", "bt2020nc",
+                               "-color_primaries", "bt2020",
+                               "-color_trc", "arib-std-b67",
+                               "-x265-params", "hdr-opt=1:repeat-headers=1"]
+            else:
+                recompress += ["-c:v", "libx264", "-preset", "veryfast"]
+            recompress += ["-b:v", str(bps), "-maxrate", str(int(bps * 1.2)),
+                           "-bufsize", str(bps * 2), "-c:a", "copy",
+                           "-movflags", "+faststart", str(smaller)]
+            _ffmpeg(recompress, f"{preset['label']} 용량 재압축")
             temp_output = smaller
         temp_output.replace(RENDER_OUTPUT)
         size = RENDER_OUTPUT.stat().st_size
@@ -804,6 +1056,7 @@ def _preview_render_worker(render_options=None):
                            original_audio=len(audio_events),
                            music_volume=music_volume, source_volume=source_volume,
                            caption_font=caption_font,
+                           hdr=hdr,
                            quality=quality, quality_label=preset["label"],
                            width=RENDER_WIDTH, height=RENDER_HEIGHT, fps=RENDER_FPS,
                            measured_lufs={e["file"]: e.get("measured_lufs")
@@ -2225,6 +2478,8 @@ def _save_plot_layout(p):
     # 이미 열려 있던 구버전 콘티 탭이 저장해도 새 효과 설정을 지우지 않는다.
     effects = (p.get("effects") if "effects" in p else
                (load_json(PLOT_LAYOUT_JSON, {}).get("effects") or {})) or {}
+    section_effects = (p.get("section_effects") if "section_effects" in p else
+                       (load_json(PLOT_LAYOUT_JSON, {}).get("section_effects") or {})) or {}
     section_starts = p.get("section_starts") or {}
     section_lyrics = p.get("section_lyrics") or {}
     fit_modes = p.get("fit_modes") or {}
@@ -2235,6 +2490,7 @@ def _save_plot_layout(p):
             not isinstance(sections, list) or not isinstance(assignments, dict) or
             not isinstance(caption_positions, dict) or not isinstance(section_starts, dict) or
             not isinstance(media_positions, dict) or not isinstance(effects, dict) or
+            not isinstance(section_effects, dict) or
             not isinstance(section_lyrics, dict) or not isinstance(fit_modes, dict) or
             not isinstance(layouts, dict)):
         return {"ok": False, "error": "잘못된 플롯 구성"}
@@ -2310,7 +2566,20 @@ def _save_plot_layout(p):
     clean_fit_modes = {str(key): str(value) for key, value in fit_modes.items()
                        if str(key) and value in ("pillarbox", "cover")}
     clean_effects = {str(key): str(value) for key, value in effects.items()
-                     if str(key) and value in ("none", "zoom_in")}
+                     if str(key) and value in ("none", "zoom_in", "zoom_in_12")}
+    clean_section_effects = {}
+    try:
+        for key, value in section_effects.items():
+            if not str(key) or not isinstance(value, dict) or value.get("type") != "grid_rows":
+                continue
+            seconds = round(float(value.get("seconds") or 0), 2)
+            if 0.1 <= seconds <= 60:
+                clean = {"type": "grid_rows", "seconds": seconds}
+                if value.get("columns") is not None:
+                    clean["columns"] = max(1, min(20, int(value["columns"])))
+                clean_section_effects[str(key)] = clean
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "그리드 행 페이드 시간을 확인해주세요"}
     clean_layouts = {str(key): str(value) for key, value in layouts.items()
                      if str(key) and re.fullmatch(
                          r"(?:row2|col2|row3|col3|hero_left3|hero_right3|grid4|row4|col4|grid\d+x\d+|row\d+|col\d+)",
@@ -2328,6 +2597,7 @@ def _save_plot_layout(p):
                                  "caption_positions": clean_caption_positions,
                                  "media_positions": clean_media_positions,
                                  "effects": clean_effects,
+                                 "section_effects": clean_section_effects,
                                  "section_starts": clean_section_starts,
                                  "section_lyrics": clean_section_lyrics,
                                  "fit_modes": clean_fit_modes,
@@ -2962,6 +3232,7 @@ def cmd_plan(args):
                                                 "caption_positions": {},
                                                 "media_positions": {},
                                                 "effects": {},
+                                                "section_effects": {},
                                                 "section_starts": {},
                                                 "section_lyrics": {},
                                                 "fit_modes": {}, "layouts": {}})
@@ -3328,10 +3599,12 @@ def _write_plot_html(plan):
             effect_controls = "".join(
                 f'<label><span>{html.escape(tile["file"]) if len(cut["tiles"]) > 1 else "사진 움직임"}</span>'
                 f'<select class="effectMode" data-file="{html.escape(tile["file"], quote=True)}">'
-                f'<option value="none"{" selected" if tile.get("effect") != "zoom_in" else ""}>'
+                f'<option value="none"{" selected" if tile.get("effect") not in ("zoom_in", "zoom_in_12") else ""}>'
                 f'움직임 없음</option>'
                 f'<option value="zoom_in"{" selected" if tile.get("effect") == "zoom_in" else ""}>'
-                f'천천히 확대 · 6%</option></select></label>'
+                f'천천히 확대 · 6%</option>'
+                f'<option value="zoom_in_12"{" selected" if tile.get("effect") == "zoom_in_12" else ""}>'
+                f'천천히 확대 · 12%</option></select></label>'
                 for tile in cut["tiles"] if tile.get("kind") == "image")
             badges = ["★ 꼭" if cut["pick"] == 2 else "보통",
                       "LIVE" if kind == "motion" else "영상" if kind == "video" else "사진"]
@@ -3436,6 +3709,7 @@ def _write_plot_html(plan):
     plan["render_keys"] = [key for group in story_groups for key in group["keys"]]
     start_overrides = plan.get("plot_layout", {}).get("section_starts") or {}
     lyric_overrides = plan.get("plot_layout", {}).get("section_lyrics") or {}
+    section_effect_overrides = plan.get("plot_layout", {}).get("section_effects") or {}
     music_starts = []
     for g in story_groups:
         default_start = g["from"] if g["custom"] else g["spec"][0]
@@ -3453,13 +3727,15 @@ def _write_plot_html(plan):
         music_to = (music_starts[group_i + 1] if group_i + 1 < len(music_starts)
                     else final_end)
         section_lyric = str(lyric_overrides.get(str(g["id"]), g["lyric"]) or "가사 없음")
+        section_effect = section_effect_overrides.get(str(g["id"])) or {}
         # 카드가 없는 '음악 추가 필요' 꼬리는 노래 뒤 수 분짜리 검은 화면이
         # 되는 것을 막는다. 실제 카드가 배치되면 정상 섹션으로 포함한다.
         if g["id"] != "after-music" or g["keys"] or final_end > song_end + .005:
             render_sections.append({"id": str(g["id"]), "title": g["title"],
                                     "from": music_from, "to": music_to,
                                     "lyric": section_lyric,
-                                    "keys": list(g["keys"])})
+                                    "keys": list(g["keys"]),
+                                    "effect": section_effect})
         section_sec = max(0.0, music_to - music_from)
         excess_sec = max(0.0, float(g.get("slide_sec") or 0) - section_sec)
         shortage_sec = max(0.0, section_sec - float(g.get("slide_sec") or 0))
@@ -3484,6 +3760,35 @@ def _write_plot_html(plan):
         # HTML 속성의 실제 개행은 파서가 공백으로 정규화한다. 문자 참조로
         # 내보내야 dataset.lyric에서도 사용자가 넣은 줄바꿈이 그대로 살아난다.
         section_lyric_attr = html.escape(section_lyric, quote=True).replace("\n", "&#10;")
+        effect_type = ("grid_rows" if section_effect.get("type") == "grid_rows"
+                       else "none")
+        try:
+            effect_seconds = max(.1, min(max(.1, section_sec), float(
+                section_effect.get("seconds") or min(6.0, max(.1, section_sec)))))
+        except (TypeError, ValueError):
+            effect_seconds = min(6.0, max(.1, section_sec))
+        grid_item_count = max(1, sum(len(key.split("|")) for key in g["keys"]))
+        default_columns = max(1, int(math.ceil(math.sqrt(grid_item_count * 16 / 9))))
+        try:
+            effect_columns = max(1, min(20, int(
+                section_effect.get("columns") or default_columns)))
+        except (TypeError, ValueError):
+            effect_columns = default_columns
+        effect_control = (
+            f'<label class="sectionEffect">연출 <select class="sectionEffectMode" '
+            f'data-id="{html.escape(str(g["id"]), quote=True)}">'
+            f'<option value="none"{" selected" if effect_type == "none" else ""}>'
+            f'기본 슬라이드</option><option value="grid_rows"'
+            f'{" selected" if effect_type == "grid_rows" else ""}>'
+            f'전체 사진 그리드 · 행 페이드</option></select></label>'
+            f'<label class="sectionEffect sectionEffectSeconds"'
+            f'{"" if effect_type == "grid_rows" else " hidden"}>총 '
+            f'<input class="sectionEffectDuration" data-id="{html.escape(str(g["id"]), quote=True)}" '
+            f'type="number" min="0.1" max="{max(.1, section_sec):.2f}" step="0.1" value="{effect_seconds:.2f}">초</label>'
+            f'<label class="sectionEffect sectionEffectColumns"'
+            f'{"" if effect_type == "grid_rows" else " hidden"}>열 '
+            f'<input class="sectionEffectColumnCount" data-id="{html.escape(str(g["id"]), quote=True)}" '
+            f'type="number" min="1" max="20" step="1" value="{effect_columns}">개</label>')
         sections.append(
             f'<section class="chapter story-section" data-id="{html.escape(str(g["id"]), quote=True)}" '
             f'data-title="{html.escape(g["title"], quote=True)}" '
@@ -3494,7 +3799,7 @@ def _write_plot_html(plan):
             f'{excess_html}{shortage_html}</time>'
             f'<strong>{html.escape(g["title"])}</strong></button><p class="editableLyric" '
             f'tabindex="0" title="클릭해서 가사 수정">{html.escape(section_lyric)}</p></div>'
-            f'<aside>{timing}<label class="sectionDone"><input type="checkbox"> 섹션 완료</label>'
+            f'<aside>{timing}{effect_control}<label class="sectionDone"><input type="checkbox"> 섹션 완료</label>'
             f'<span class="screenCount" data-count="{len(g["cards"])}">{len(g["cards"])}화면</span>'
             f'<button class="editSectionCaptionPos" type="button">자막 위치</button>'
             f'<button class="addSelectedHere" type="button" disabled>선택 항목 넣기</button>'
@@ -3540,6 +3845,7 @@ def _write_plot_html(plan):
 .bulkMove{max-width:1500px;margin:8px auto 0;padding:9px 11px;border:1px solid #d8a7b5;border-radius:12px;background:#fff3f7;display:flex;align-items:center;gap:8px;flex-wrap:wrap;color:var(--ink);font-size:12px}.bulkMove[hidden]{display:none}.bulkMove b{margin-right:2px}.bulkMove select{min-width:260px;max-width:520px;border:1px solid #d8a7b5;border-radius:8px;background:#fff;padding:7px;font:12px inherit}.bulkMove button{border:0;border-radius:8px;background:var(--ink);color:#fff;padding:7px 12px;cursor:pointer;font:12px inherit;font-weight:700}
 .plot-workspace{max-width:1840px;margin:25px auto 90px;padding:0 18px;display:grid;grid-template-columns:minmax(0,1fr) 350px;gap:18px;align-items:start}.story-main{min-width:0}.chapter{margin:0 0 28px}.story-section{padding:12px;border:1px solid var(--line);border-radius:18px;background:#fff9f8;scroll-margin-top:190px}.story-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;border-bottom:2px solid #ead5dc;padding:0 3px 10px;margin-bottom:12px}.story-head>div{min-width:0;flex:1}.story-head p{margin:5px 3px 0;color:var(--ink);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.editableLyric{min-height:27px;padding:3px 7px;border:1px dashed transparent;border-radius:7px;cursor:text}.editableLyric:hover,.editableLyric:focus{border-color:#d8a7b5;background:#fff;outline:none}.editableLyric.editing{white-space:normal;overflow:visible;text-overflow:clip;box-shadow:0 0 0 2px #d9779122}.story-head aside{display:flex;align-items:center;gap:7px;color:var(--dim);white-space:nowrap}.sectionTiming{display:flex;align-items:center;gap:4px;color:var(--ink);font-size:11px}.sectionTiming input{width:72px;border:1px solid var(--line);border-radius:7px;padding:4px 5px;font:11px inherit}.sectionTiming input:disabled{background:#eee8e6;color:#999}.lyric-heading{display:flex;align-items:baseline;gap:10px;border:0;background:none;padding:0;color:var(--fg);cursor:pointer;text-align:left}.lyric-heading time{display:flex;align-items:center;gap:5px;font-weight:800;color:var(--pink);white-space:nowrap}.lyric-heading time em{font-style:normal;color:var(--dim);font-weight:600}.lyric-heading time .sectionExcess,.lyric-heading time .sectionShortage{padding:2px 6px;border-radius:999px;font-size:10px}.lyric-heading time .sectionExcess{background:#ffe7e7;color:#b1263b}.lyric-heading time .sectionShortage{background:#fff1d6;color:#986014}.lyric-heading strong{font-size:20px}.story-section.active{border-color:#d97791;box-shadow:0 0 0 2px #d9779122}.story-section.active .lyric-heading strong{color:var(--ink)}.removeSection,.sortChronological,.addSelectedHere{border:1px solid var(--line);background:#fff;border-radius:8px;padding:4px 7px;color:var(--dim);cursor:pointer;font:11px inherit}.removeSection{color:#a45b65}.addSelectedHere{display:none;border-color:#d895a8;color:#8f3f58;background:#fff2f6;font-weight:700}.select-mode .addSelectedHere{display:inline-block}.addSelectedHere:disabled,.sortChronological:disabled{opacity:.35;cursor:default}
 .story-head p.editableLyric{white-space:pre-wrap;overflow:visible;text-overflow:clip;word-break:keep-all}
+.story-head aside{flex-wrap:wrap;justify-content:flex-end}.sectionEffect{display:flex;align-items:center;gap:4px;padding:3px 6px;border:1px solid #ddc5cf;border-radius:8px;background:#fff4f8;color:var(--ink);font-size:11px}.sectionEffect select,.sectionEffect input{border:1px solid #d8a7b5;border-radius:6px;background:#fff;padding:3px 4px;color:var(--ink);font:11px inherit}.sectionEffect select{max-width:190px}.sectionEffect input{width:58px;text-align:right}.sectionEffect[hidden]{display:none}
 .backlog{position:sticky;top:190px;height:calc(100vh - 210px);min-height:360px;display:flex;flex-direction:column;border:1px solid #d9c8c3;border-radius:18px;background:#fff;overflow:hidden;box-shadow:0 8px 28px #64483e18}.backlog-head{padding:13px 14px 11px;border-bottom:1px solid var(--line);background:#fff9f7}.backlog-head h2{font-size:17px;margin:0}.backlog-head p{margin:3px 0 9px;color:var(--dim);font-size:11px}.showExcluded{display:flex;align-items:center;gap:6px;margin-top:8px;font-size:12px;color:var(--ink);cursor:pointer}.showExcluded input{accent-color:var(--pink)}#backlogSelectBtn{border:1px solid #d8a7b5;background:#fff;color:var(--ink);border-radius:9px;padding:6px 9px;cursor:pointer;font:12px inherit}#backlogSelectBtn.on{background:var(--ink);color:#fff}.backlog-scroll{flex:1;overflow:auto;padding:10px}.backlog-cuts{display:flex;flex-direction:column;gap:10px;min-height:140px}.backlog-cuts:empty::after{content:'모든 슬라이드가 왼쪽 콘티에 배치되었습니다';display:flex;min-height:120px;align-items:center;justify-content:center;text-align:center;border:2px dashed var(--line);border-radius:12px;color:var(--dim)}.backlog .cut{flex:none}.backlog .preview{height:175px}.backlog .arrange .earlier,.backlog .arrange .later{display:none}.backlog.drop-target{border-color:var(--pink);box-shadow:0 0 0 3px #d9779133}.excluded-list{display:none;margin-top:14px;padding-top:14px;border-top:2px solid #e5dddd;flex-direction:column;gap:9px}.backlog.show-excluded .excluded-list{display:flex}.excluded-source{display:grid;grid-template-columns:100px minmax(0,1fr);gap:9px;padding:8px;border:1px solid #d8d3d1;border-radius:12px;background:#e7e5e4;color:#777;filter:grayscale(1);opacity:.8}.excluded-source img{width:100px;height:82px;object-fit:contain;background:#d2d0cf;border-radius:8px}.excluded-source div{min-width:0}.excluded-source b,.excluded-source small{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.excluded-source b{font-size:12px}.excluded-source small{font-size:10px;margin:3px 0 8px}.reinclude{border:1px solid #aaa;background:#f5f4f3;color:#555;border-radius:7px;padding:4px 7px;cursor:pointer;font:11px inherit}
 .backlogFilters{display:flex;flex-direction:column;gap:6px;margin-top:8px}.backlogFilters .showExcluded{margin-top:0}.backlogKind{display:grid;grid-template-columns:repeat(3,1fr);gap:4px}.backlogKind button{border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--dim);padding:6px 3px;font:11px inherit;cursor:pointer}.backlogKind button.on{border-color:var(--ink);background:var(--ink);color:#fff;font-weight:700}.backlog[data-kind-filter="video"] .backlog-cuts .cut:not(.video),.backlog[data-kind-filter="motion"] .backlog-cuts .cut:not(.motion){display:none}.backlogFilterEmpty{display:none;min-height:120px;align-items:center;justify-content:center;text-align:center;border:2px dashed var(--line);border-radius:12px;color:var(--dim);padding:15px}.backlog.no-kind-result .backlogFilterEmpty{display:flex}
 .story-section.drop-target{border-color:#d97791;background:#fff0f4;box-shadow:0 0 0 3px #d9779133}.story-section.drop-target .cuts{min-height:120px}.story-section.drop-target .cuts::after{content:'여기에 놓으면 이 섹션 마지막으로 이동';grid-column:1/-1;display:flex;align-items:center;justify-content:center;min-height:100px;border:2px dashed #d97791;border-radius:12px;color:#a45169;background:#fff8fa}
@@ -3548,21 +3854,21 @@ def _write_plot_html(plan):
 .cut.notRendered{filter:grayscale(.85);opacity:.46}.cut.notRendered::after,.cut.partRendered::after{position:absolute;z-index:7;left:8px;right:8px;top:34px;padding:7px 8px;border-radius:9px;text-align:center;font-size:11px;font-weight:900;pointer-events:none;box-shadow:0 2px 10px #0003}.cut.notRendered::after{content:'영상에 안 나옴 · 섹션 시간 초과';background:#842f3ee8;color:#fff}.cut.partRendered::after{content:'영상 끝부분 잘림 · 섹션 시간 초과';background:#ffe3a8ed;color:#805008}.screenCount.hasOmitted{color:#b1263b;font-weight:900}
 .timing{display:flex;align-items:center;gap:5px;margin-top:8px;color:var(--ink);font-size:11px}.timing input{width:65px;border:1px solid var(--line);border-radius:7px;padding:4px 6px;font:12px inherit}.fitModes{display:flex;flex-direction:column;gap:5px;margin-top:8px}.fitModes label{display:flex;flex-direction:column;gap:2px;min-width:0;color:var(--dim);font-size:10px}.fitModes label span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.fitMode,.effectMode{width:100%;border:1px solid var(--line);border-radius:7px;background:#fff;padding:5px 6px;color:var(--ink);font:11px inherit}.effectMode{border-color:#d8a7b5;background:#fff8fa}.excludeOne{width:100%;margin-top:7px;border:1px solid #efd1d6;background:#fff8f8;color:#a33d4b;border-radius:8px;padding:5px;cursor:pointer;font:11px inherit}.excludeOne:hover{background:#ffe9eb}
 details.warn{max-width:1500px;margin:18px auto;padding:0 22px}details.warn summary{cursor:pointer;color:#9b682b}details.warn ul{max-height:240px;overflow:auto;background:#fff;border:1px solid var(--line);padding:14px 14px 14px 34px;border-radius:12px}
-dialog{width:min(1200px,96vw,calc(88vh * 16 / 9));height:auto;border:0;border-radius:18px;padding:0;box-shadow:0 20px 70px #36262155}dialog::backdrop{background:#362621b8}.modal-head{display:flex;align-items:center;gap:7px;padding:10px 13px;border-bottom:1px solid var(--line)}.modal-head h2{font-size:15px;margin:0;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.modal-head button,.modal-head a{border:1px solid var(--line);background:#fff;color:var(--fg);border-radius:10px;min-width:42px;height:38px;padding:0 9px;font:12px inherit;line-height:36px;text-align:center;text-decoration:none;cursor:pointer;white-space:nowrap}.modal-head #prevCut,.modal-head #nextCut{font-size:25px;padding:0}.modal-head button:disabled{opacity:.3;cursor:default}.modal-head button.on{background:var(--ink);border-color:var(--ink);color:#fff}.modal-head .close{border:0;background:none;font-size:27px;padding:0}.modal-media{position:relative;width:100%;aspect-ratio:16/9;background:#211e1d;overflow:hidden}.modal-media .tile{position:absolute;padding:5px;display:flex;align-items:center;justify-content:center;overflow:hidden}.modal-media img,.modal-media video{display:block;width:100%;height:100%;object-fit:contain}.modal.pan-mode .tile{outline:2px dashed #ffd0dc;outline-offset:-5px;cursor:grab;touch-action:none}.modal.pan-mode .tile:active{cursor:grabbing}.modal.pan-mode video{pointer-events:none}.modal.pan-mode .caption-overlay{pointer-events:none;opacity:.35}.modal.caption-moving .modal-media::before,.modal.caption-moving .modal-media::after{content:'';position:absolute;z-index:7;pointer-events:none;background:#ffb6c9aa}.modal.caption-moving .modal-media::before{left:50%;top:0;bottom:0;width:1px}.modal.caption-moving .modal-media::after{top:50%;left:0;right:0;height:1px}.caption-overlay{position:absolute;z-index:8;transform:translate(-50%,-50%);max-width:92%;padding:0;color:#fff;text-align:center;white-space:pre;overflow:visible;text-shadow:0 2px 5px #000,0 0 12px #000;cursor:move;touch-action:none;user-select:none}.caption-overlay::after{content:'텍스트 중심 기준 · 드래그';position:absolute;left:50%;top:100%;transform:translateX(-50%);font:10px sans-serif;color:#fff9;background:#0008;border-radius:999px;padding:2px 5px;text-shadow:none;white-space:nowrap}.caption-overlay.moving{outline:1px dashed #ffd0dc;border-radius:7px}.caption-overlay.moving::before{content:'';position:absolute;left:50%;top:50%;width:7px;height:7px;transform:translate(-50%,-50%);border:2px solid #ff9bb6;border-radius:50%;background:#fff;box-shadow:0 0 0 2px #0005}@keyframes gentleZoom{from{scale:1}to{scale:1.06}}
+dialog{width:min(1200px,96vw,calc(88vh * 16 / 9));height:auto;border:0;border-radius:18px;padding:0;box-shadow:0 20px 70px #36262155}dialog::backdrop{background:#362621b8}.modal-head{display:flex;align-items:center;gap:7px;padding:10px 13px;border-bottom:1px solid var(--line)}.modal-head h2{font-size:15px;margin:0;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.modal-head button,.modal-head a{border:1px solid var(--line);background:#fff;color:var(--fg);border-radius:10px;min-width:42px;height:38px;padding:0 9px;font:12px inherit;line-height:36px;text-align:center;text-decoration:none;cursor:pointer;white-space:nowrap}.modal-head #prevCut,.modal-head #nextCut{font-size:25px;padding:0}.modal-head button:disabled{opacity:.3;cursor:default}.modal-head button.on{background:var(--ink);border-color:var(--ink);color:#fff}.modal-head .close{border:0;background:none;font-size:27px;padding:0}.modal-media{position:relative;width:100%;aspect-ratio:16/9;background:#211e1d;overflow:hidden}.modal-media .tile{position:absolute;padding:5px;display:flex;align-items:center;justify-content:center;overflow:hidden}.modal-media img,.modal-media video{display:block;width:100%;height:100%;object-fit:contain}.modal.pan-mode .tile{outline:2px dashed #ffd0dc;outline-offset:-5px;cursor:grab;touch-action:none}.modal.pan-mode .tile:active{cursor:grabbing}.modal.pan-mode video{pointer-events:none}.modal.pan-mode .caption-overlay{pointer-events:none;opacity:.35}.modal.caption-moving .modal-media::before,.modal.caption-moving .modal-media::after{content:'';position:absolute;z-index:7;pointer-events:none;background:#ffb6c9aa}.modal.caption-moving .modal-media::before{left:50%;top:0;bottom:0;width:1px}.modal.caption-moving .modal-media::after{top:50%;left:0;right:0;height:1px}.caption-overlay{position:absolute;z-index:8;transform:translate(-50%,-50%);max-width:92%;padding:0;color:#fff;text-align:center;white-space:pre;overflow:visible;text-shadow:0 2px 5px #000,0 0 12px #000;cursor:move;touch-action:none;user-select:none}.caption-overlay::after{content:'텍스트 중심 기준 · 드래그';position:absolute;left:50%;top:100%;transform:translateX(-50%);font:10px sans-serif;color:#fff9;background:#0008;border-radius:999px;padding:2px 5px;text-shadow:none;white-space:nowrap}.caption-overlay.moving{outline:1px dashed #ffd0dc;border-radius:7px}.caption-overlay.moving::before{content:'';position:absolute;left:50%;top:50%;width:7px;height:7px;transform:translate(-50%,-50%);border:2px solid #ff9bb6;border-radius:50%;background:#fff;box-shadow:0 0 0 2px #0005}@keyframes gentleZoom{from{scale:1}to{scale:1.06}}@keyframes gentleZoom12{from{scale:1}to{scale:1.12}}
 .positionEditor{display:flex;gap:12px;align-items:flex-start;padding:8px 13px;border-bottom:1px solid var(--line);background:#fff9f8;max-height:155px;overflow:auto}.captionCoords,.mediaPositionRow{display:flex;align-items:center;gap:6px;flex-wrap:wrap}.captionCoords{min-width:310px}.positionEditor label{display:flex;align-items:center;gap:3px;font-size:11px;color:var(--dim)}.positionEditor input{width:65px;border:1px solid var(--line);border-radius:7px;padding:5px 6px;font:12px inherit;text-align:right}.positionEditor small{font-size:10px;color:#9a8983}.mediaPositionRows{display:flex;flex:1;flex-direction:column;gap:5px}.mediaPositionRow{padding-left:10px;border-left:1px solid var(--line)}.mediaPositionRow b{max-width:230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px}.mediaPositionRow input:disabled{background:#eee;color:#aaa}.editSectionCaptionPos{border-color:#d8a7b5!important;color:#8f3f58!important}
 body[data-filter="video"] .cut:not(.video),body[data-filter="motion"] .cut:not(.motion),body[data-filter="image"] .cut:not(.image),body[data-filter="open"] .cut.done{display:none}
 @media(max-width:1050px){.plot-workspace{grid-template-columns:1fr}.backlog{position:relative;top:auto;height:65vh;grid-row:1;margin-bottom:10px}}
 @media(max-width:600px){.cuts{grid-template-columns:repeat(2,minmax(0,1fr))}.preview{height:115px}.top{padding:12px}.info small{display:none}.story-section{padding:7px}.story-head p{white-space:normal;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.lyric-heading strong{font-size:17px}.musichead small{display:none}.plot-workspace{padding:0 8px}.backlog .preview{height:145px}}
 </style></head><body data-filter="all">
 <header class="top"><div class="inner"><h1>🎞 영상 플롯 검토</h1><span class="summary">{{SUMMARY}}</span><button id="serverStatus" class="serverStatus">● 서버 연결 확인 중</button><span id="lastSaved" class="lastSaved">마지막 저장 확인 중</span><div class="progress"><span id="prog">0 / {{CUTS}} 검토</span><div class="bar"><i></i></div></div><a class="back" href="index.html">갤러리로</a></div>
-<div class="tools"><button class="on" data-f="all">전체</button><button data-f="open">미검토</button><button data-f="image">사진</button><button data-f="motion">LIVE</button><button data-f="video">영상</button><button id="selectModeBtn">☑ 슬라이드 선택</button><button id="merge" hidden>선택 슬라이드 합치기</button><button id="split" hidden>선택 슬라이드 분리</button><button id="addSection" hidden>선택 위치에 섹션 추가</button><button id="excludeSelected" hidden>✕ 선택 제외</button><label class="renderLevel">노래 <input id="renderMusicVolume" type="number" min="0" max="200" step="5" value="100">%</label><label class="renderLevel">영상 원음 <input id="renderSourceVolume" type="number" min="0" max="200" step="5" value="70">%</label><label class="renderLevel">자막 폰트 <select id="renderCaptionFont"><option value="maru_buri">마루부리 · 세련된 명조</option><option value="nanum_pen">나눔 펜 손글씨</option><option value="nanum_brush">나눔 붓 손글씨</option><option value="nanum_myeongjo">나눔 명조</option><option value="apple_myungjo">애플 명조</option><option value="apple_gothic">애플 고딕</option></select></label><button id="renderPreview">🎬 저용량 검토 영상 만들기</button><span id="renderProgress" class="renderProgress"><progress id="renderProgressBar" max="100" value="0"></progress><b id="renderProgressText">0%</b></span><a id="renderResult" class="renderResult" target="_blank" hidden>완성 영상 열기</a><button id="backupAll">💾 전체 백업</button><button id="clear">검토 체크 초기화</button><span id="layoutStatus"></span></div>
+<div class="tools"><button class="on" data-f="all">전체</button><button data-f="open">미검토</button><button data-f="image">사진</button><button data-f="motion">LIVE</button><button data-f="video">영상</button><button id="selectModeBtn">☑ 슬라이드 선택</button><button id="merge" hidden>선택 슬라이드 합치기</button><button id="split" hidden>선택 슬라이드 분리</button><button id="addSection" hidden>선택 위치에 섹션 추가</button><button id="excludeSelected" hidden>✕ 선택 제외</button><label class="renderLevel">노래 <input id="renderMusicVolume" type="number" min="0" max="200" step="5" value="100">%</label><label class="renderLevel">영상 원음 <input id="renderSourceVolume" type="number" min="0" max="200" step="5" value="70">%</label><label class="renderLevel">자막 폰트 <select id="renderCaptionFont"><option value="maru_buri">마루부리 · 세련된 명조</option><option value="nanum_pen">나눔 펜 손글씨</option><option value="nanum_brush">나눔 붓 손글씨</option><option value="nanum_myeongjo">나눔 명조</option><option value="apple_myungjo">애플 명조</option><option value="apple_gothic">애플 고딕</option></select></label><label class="renderLevel" title="HDR 영상을 SDR로 바꾸지 않고 10비트 HLG로 유지합니다"><input id="renderHdr" type="checkbox" checked> HDR 원본 유지</label><button id="renderPreview">🎬 저용량 검토 영상 만들기</button><span id="renderProgress" class="renderProgress"><progress id="renderProgressBar" max="100" value="0"></progress><b id="renderProgressText">0%</b></span><a id="renderResult" class="renderResult" target="_blank" hidden>완성 영상 열기</a><button id="backupAll">💾 전체 백업</button><button id="clear">검토 체크 초기화</button><span id="layoutStatus"></span></div>
 <div id="bulkMove" class="bulkMove" hidden><b id="bulkMoveCount">선택 0개</b><label>이동할 섹션 <select id="bulkMoveSection"><option value="">섹션을 선택하세요</option></select></label><button id="bulkMoveButton" type="button">선택 항목 이동</button></div>
-<section class="musicbox"><div class="musichead"><h2>🎵 O My Baby</h2><audio id="song" controls preload="metadata" src="{{MUSIC_SRC}}"></audio><label class="followSong"><input id="followSong" type="checkbox"> 재생 위치 따라가기</label><button id="addEmptySection" type="button">＋ 빈 섹션 추가</button><label class="renderLevel">영상 최종 종료 <input id="finalEnd" type="number" min="252.82" max="36000" step="0.1" value="{{FINAL_END}}">초</label><small id="musicNote">가사 절 제목을 누르면 해당 위치 재생 · 자동 추출 문구 검토 필요</small></div></section></header>
+<section class="musicbox"><div class="musichead"><h2>🎵 O My Baby</h2><audio id="song" controls preload="metadata" src="{{MUSIC_SRC}}"></audio><label class="followSong"><input id="followSong" type="checkbox"> 재생 위치 따라가기</label><button id="addEmptySection" type="button">＋ 빈 섹션 추가</button><label class="renderLevel">영상 최종 종료 <input id="finalEnd" type="number" min="252.82" max="36000" step="0.1" value="{{FINAL_END}}">초</label><small id="musicNote">자막 줄 앞에 &lt;1.25s&gt;를 쓰면 그 줄부터 섹션 시작 1.25초 뒤 페이드 인 · 가사 절 제목을 누르면 해당 위치 재생</small></div></section></header>
 <details class="warn"><summary>⚠ 확인할 사항 {{WARNS}}개</summary><ul>{{WARNINGS}}</ul></details>
 <div class="plot-workspace"><main class="story-main">{{SECTIONS}}</main><aside id="backlogPane" class="backlog" data-kind-filter="all"><header class="backlog-head"><h2>미배치 슬라이드 · {{BACKLOG_COUNT}}개</h2><p>시간순 · 왼쪽 가사 섹션으로 드래그하세요</p><button id="backlogSelectBtn" type="button">☑ 여러 장 선택</button><div class="backlogFilters"><div class="backlogKind" aria-label="미배치 종류 필터"><button type="button" data-backlog-kind="all">전체</button><button type="button" data-backlog-kind="video">동영상 {{VIDEO_BACKLOG_COUNT}}</button><button type="button" data-backlog-kind="motion">LIVE {{MOTION_BACKLOG_COUNT}}</button></div><label class="showExcluded"><input id="showExcluded" type="checkbox"> 제외 항목 포함 ({{EXCLUDED_COUNT}}개)</label></div></header><div class="backlog-scroll"><div id="backlogCuts" class="backlog-cuts">{{BACKLOG}}</div><div class="backlogFilterEmpty">이 종류의 미배치 슬라이드가 없습니다</div><section class="excluded-list">{{EXCLUDED}}</section></div></aside></div><div id="offlinePopup" class="offlinePopup" role="alertdialog" aria-modal="true"><div class="offlineCard"><strong>서버 연결이 끊겼습니다</strong><p>지금 변경한 내용은 자동 저장되지 않습니다.<br>서버를 다시 시작한 뒤 연결을 확인해 주세요.</p><button id="retryServer" type="button">연결 다시 확인</button></div></div><dialog id="modal"><div class="modal-head"><button id="prevCut" aria-label="이전 슬라이드" title="이전 슬라이드 (←)">‹</button><h2></h2><a id="cropEdit" target="_blank">남길 영역</a><button id="panMediaBtn">사진·영상 위치 이동</button><button id="saveMediaPos" disabled>화면 위치 저장</button><button id="saveCaptionPos">섹션 자막 위치 저장</button><button id="nextCut" aria-label="다음 슬라이드" title="다음 슬라이드 (→)">›</button><button class="close" aria-label="닫기">×</button></div><div id="positionEditor" class="positionEditor"><div class="captionCoords"><b>자막 중심</b><label>X <input id="captionPosX" type="number" min="0" max="100" step="0.1">%</label><label>Y <input id="captionPosY" type="number" min="0" max="100" step="0.1">%</label><small>화면 왼쪽·위가 0%, 오른쪽·아래가 100%</small></div><div id="mediaPositionRows" class="mediaPositionRows"></div></div><div class="modal-media"></div></dialog>
 <script>const PLAN={{DATA}},PLAN_VERSION={{PLAN_VERSION}},CUTS=PLAN.chapters.flatMap(c=>c.cuts),cards=[...document.querySelectorAll('.cut')];
 let completedSections=new Set(JSON.parse(localStorage.getItem('jiho.plot.sectionReview')||'[]'));const saveSectionReview=()=>localStorage.setItem('jiho.plot.sectionReview',JSON.stringify([...completedSections]));
-let layout=JSON.parse(JSON.stringify(PLAN.plot_layout||{groups:[],separate:[],order:[],durations:{},sections:[],section_assignments:{},caption_positions:{},media_positions:{},effects:{},section_starts:{},section_lyrics:{},fit_modes:{},layouts:{},final_end:252.82})),dragging=null,selectMode=false;layout.durations=layout.durations||{};layout.sections=layout.sections||[];layout.section_assignments=layout.section_assignments||{};layout.caption_positions=layout.caption_positions||{};layout.media_positions=layout.media_positions||{};layout.effects=layout.effects||{};layout.section_starts=layout.section_starts||{};layout.section_lyrics=layout.section_lyrics||{};layout.fit_modes=layout.fit_modes||{};layout.layouts=layout.layouts||{};layout.final_end=+layout.final_end||252.82;
+let layout=JSON.parse(JSON.stringify(PLAN.plot_layout||{groups:[],separate:[],order:[],durations:{},sections:[],section_assignments:{},caption_positions:{},media_positions:{},effects:{},section_effects:{},section_starts:{},section_lyrics:{},fit_modes:{},layouts:{},final_end:252.82})),dragging=null,selectMode=false;layout.durations=layout.durations||{};layout.sections=layout.sections||[];layout.section_assignments=layout.section_assignments||{};layout.caption_positions=layout.caption_positions||{};layout.media_positions=layout.media_positions||{};layout.effects=layout.effects||{};layout.section_effects=layout.section_effects||{};layout.section_starts=layout.section_starts||{};layout.section_lyrics=layout.section_lyrics||{};layout.fit_modes=layout.fit_modes||{};layout.layouts=layout.layouts||{};layout.final_end=+layout.final_end||252.82;
 const song=document.querySelector('#song'),followSong=document.querySelector('#followSong'),lyricButtons=[...document.querySelectorAll('.lyric-heading')];let activeLyric=null;followSong.checked=localStorage.getItem('jiho.plot.followSong')==='1';followSong.onchange=()=>localStorage.setItem('jiho.plot.followSong',followSong.checked?'1':'0');
 lyricButtons.forEach(b=>b.onclick=()=>{const t=+b.dataset.from;song.currentTime=t;song.play().catch(()=>{});b.closest('.story-section')?.scrollIntoView({behavior:'smooth',block:'start'})});
 song.addEventListener('keydown',e=>{if(e.code==='Space'){e.preventDefault();e.stopPropagation();song.blur()}});
@@ -3583,6 +3889,7 @@ function assignToTarget(c,target){const a=c.closest('.story-section')?.dataset.i
 function moveCard(c,delta){if(!c.closest('.story-section'))return;const siblings=[...c.closest('.cuts').querySelectorAll('.cut')],i=siblings.indexOf(c),target=siblings[i+delta];if(!target)return;recordRelativeOrder(c,target,delta>0);delta<0?target.before(c):target.after(c);commitLayout()}
 function progress(){const sections=[...document.querySelectorAll('.story-section')],valid=new Set(sections.map(s=>s.dataset.id));completedSections=new Set([...completedSections].filter(id=>valid.has(id)));sections.forEach(s=>{const on=completedSections.has(s.dataset.id),box=s.querySelector('.sectionDone input');s.classList.toggle('section-done',on);if(box)box.checked=on});document.querySelector('#prog').textContent=`${completedSections.size} / ${sections.length} 섹션 완료`;document.querySelector('.bar i').style.width=(sections.length?completedSections.size/sections.length*100:0)+'%'}
 function paintRenderCoverage(){document.querySelectorAll('.story-section').forEach(section=>{const sectionSec=Math.max(0,(+section.dataset.to||0)-(+section.dataset.from||0)),sectionCards=[...section.querySelectorAll('.cut')],total=sectionCards.reduce((sum,c)=>sum+Math.max(0,+c.querySelector('.duration')?.value||0),0);let remaining=sectionSec,stopped=false,omitted=0,partial=0;sectionCards.forEach(c=>{c.classList.remove('notRendered','partRendered');const dur=Math.max(0,+c.querySelector('.duration')?.value||0);if(stopped||remaining<1/15){c.classList.add('notRendered');omitted++;stopped=true;return}if(dur>remaining+.005){c.classList.add('partRendered');partial++;remaining=0;stopped=true}else remaining-=dur});const time=section.querySelector('.lyric-heading time'),seconds=time?.querySelector('em');if(seconds)seconds.textContent=`(${sectionSec.toFixed(2)}초)`;time?.querySelectorAll('.sectionExcess,.sectionShortage').forEach(x=>x.remove());const delta=total-sectionSec;if(time&&Math.abs(delta)>.005){const badge=document.createElement('b');badge.className=delta>0?'sectionExcess':'sectionShortage';badge.textContent=delta>0?`영상 +${delta.toFixed(2)}초 초과`:`영상 ${(-delta).toFixed(2)}초 부족`;time.appendChild(badge)}const count=section.querySelector('.screenCount');if(count){count.classList.toggle('hasOmitted',omitted>0||partial>0);count.textContent=`${count.dataset.count}화면${omitted?` · ${omitted}화면 미출력`:''}${partial?' · 1화면 일부':''}`}})}
+const paintRenderCoverageBase=paintRenderCoverage;paintRenderCoverage=()=>{paintRenderCoverageBase();document.querySelectorAll('.story-section').forEach(section=>{const effect=layout.section_effects[section.dataset.id];if(effect?.type!=='grid_rows')return;section.querySelectorAll('.cut').forEach(c=>c.classList.remove('notRendered','partRendered'));const time=section.querySelector('.lyric-heading time');time?.querySelectorAll('.sectionExcess,.sectionShortage').forEach(x=>x.remove());const count=section.querySelector('.screenCount'),items=[...section.querySelectorAll('.cut')].reduce((n,c)=>n+filesOf(c).length,0),columns=Math.max(1,+effect.columns||1),rows=Math.max(1,Math.ceil(items/columns));if(count){count.classList.remove('hasOmitted');count.textContent=`사진 ${items}개 · ${columns}열×${rows}행 그리드`}})};
 function selectionUI(){const cs=selected(),backlogSelected=cs.filter(c=>c.closest('#backlogCuts'));document.body.classList.toggle('select-mode',selectMode);cards.forEach(c=>c.classList.toggle('selected',c.querySelector('.groupcheck').checked));const mode=document.querySelector('#selectModeBtn'),backlogMode=document.querySelector('#backlogSelectBtn');mode.classList.toggle('on',selectMode);mode.textContent=selectMode?`☑ 선택 중 ${cs.length}개 · 끝내기`:'☑ 슬라이드 선택';backlogMode.classList.toggle('on',selectMode);backlogMode.textContent=selectMode?`☑ 미배치 ${backlogSelected.length}개 선택됨`:'☑ 여러 장 선택';document.querySelectorAll('.addSelectedHere').forEach(b=>{b.disabled=!backlogSelected.length;b.textContent=backlogSelected.length?`선택 ${backlogSelected.length}개 넣기`:'선택 항목 넣기'});document.querySelectorAll('.sortChronological').forEach(b=>b.disabled=b.closest('.story-section').querySelectorAll('.cut').length<2);document.querySelector('#merge').hidden=!selectMode||cs.length<2;document.querySelector('#split').hidden=!selectMode||!cs.length;document.querySelector('#addSection').hidden=!selectMode||cs.length!==1;document.querySelector('#excludeSelected').hidden=!selectMode||!cs.length}
 const selectionUIBase=selectionUI;selectionUI=()=>{selectionUIBase();const count=selected().length;bulkMove.hidden=!selectMode||!count;bulkMoveCount.textContent=`선택 ${count}개`};
 const serverStatus=document.querySelector('#serverStatus'),lastSaved=document.querySelector('#lastSaved'),offlinePopup=document.querySelector('#offlinePopup');let serverOnline=null,unsavedLayout=false;
@@ -3597,11 +3904,14 @@ const qualityLabel=document.createElement('label');qualityLabel.className='rende
 const originalPaintRender=paintRender;paintRender=function(j){originalPaintRender(j);const busy=j.state==='queued'||j.state==='running',label=j.quality_label||renderQuality.selectedOptions[0].textContent.split(' · ')[0];renderQuality.disabled=busy;if(busy)renderPreview.textContent=`🎬 ${label} 만드는 중 ${Math.max(0,Math.min(100,Math.round((+j.done||0)/(+j.total||1)*100)))}%`;else renderPreview.textContent=`🎬 ${renderQuality.selectedOptions[0].textContent.split(' · ')[0]} 영상 만들기`};
 const CAPTION_STYLES={maru_buri:{size:23,wrap:26,lineSpacing:4,family:'MaruBuri'},nanum_myeongjo:{size:22,wrap:27,lineSpacing:4,family:'NanumMyeongjo'},apple_myungjo:{size:20,wrap:29,lineSpacing:4,family:'AppleMyungjo'},nanum_pen:{size:34,wrap:19,lineSpacing:4,family:'NanumPen'},nanum_brush:{size:33,wrap:20,lineSpacing:4,family:'NanumBrush'},apple_gothic:{size:23,wrap:26,lineSpacing:4,family:'AppleGothic'}};
 const captionMeasureCanvas=document.createElement('canvas'),captionMeasureContext=captionMeasureCanvas.getContext('2d');
+function parseCaptionCues(text){const raw=String(text||''),re=/<\s*(\d+(?:\.\d+)?)\s*s\s*>/ig,chunks=[];let delay=0,cursor=0,m;while((m=re.exec(raw))){if(m.index>cursor)chunks.push({delay,text:raw.slice(cursor,m.index)});delay=Math.max(0,Math.min(3600,+m[1]||0));cursor=re.lastIndex}if(cursor<raw.length)chunks.push({delay,text:raw.slice(cursor)});return{chunks,text:chunks.map(x=>x.text).join('').trim()}}
+function parseCaptionDelay(text){const parsed=parseCaptionCues(text);return{delay:parsed.chunks[0]?.delay||0,text:parsed.text}}
 function wrapCaption(text,style){captionMeasureContext.font=`${style.size}px ${style.family},cursive`;const maxWidth=640*.92,measure=s=>captionMeasureContext.measureText(s||' ').width,splitToken=token=>{const chunks=[];let current='';for(const char of token){const candidate=current+char;if(current&&measure(candidate)>maxWidth){chunks.push(current);current=char}else current=candidate}if(current)chunks.push(current);return chunks.length?chunks:['']},out=[];for(let raw of String(text||'').split(/\r?\n/)){raw=raw.trim();if(!raw){out.push('');continue}let current='';for(const word of raw.split(' ')){const pieces=measure(word)>maxWidth?splitToken(word):[word];pieces.forEach((piece,i)=>{const candidate=(current+' '+piece).trim();if(current&&measure(candidate)>maxWidth){out.push(current);current=piece}else current=candidate;if(i<pieces.length-1){out.push(current);current=''}})}if(current)out.push(current)}return out.join('\n')}
-function applyCaptionPreviewStyle(){if(!captionOverlayEl)return;const style=CAPTION_STYLES[renderCaptionFont.value]||CAPTION_STYLES.nanum_brush,scale=media.clientWidth/640;captionOverlayEl.style.fontFamily=`${style.family},cursive`;captionOverlayEl.style.fontSize=(style.size*scale)+'px';captionOverlayEl.style.lineHeight=((style.size+style.lineSpacing)/style.size);captionOverlayEl.textContent=wrapCaption(captionOverlayEl.dataset.caption,style);requestAnimationFrame(()=>{if(draftCaptionPos){draftCaptionPos=clampCaptionPos(draftCaptionPos);paintCaptionOverlay()}})}
+function applyCaptionPreviewStyle(){if(!captionOverlayEl)return;const style=CAPTION_STYLES[renderCaptionFont.value]||CAPTION_STYLES.nanum_brush,scale=media.clientWidth/640,baseSize=style.size*scale;captionOverlayEl.style.fontFamily=`${style.family},cursive`;captionOverlayEl.style.fontSize=baseSize+'px';captionOverlayEl.style.lineHeight=((style.size+style.lineSpacing)/style.size);captionOverlayEl.style.whiteSpace='pre';captionOverlayEl.style.maxWidth='none';if(!captionOverlayEl.dataset.cued)captionOverlayEl.textContent=captionOverlayEl.dataset.caption;requestAnimationFrame(()=>{const limit=media.clientWidth*.92,actual=captionOverlayEl.scrollWidth;if(actual>limit)captionOverlayEl.style.fontSize=Math.max(1,baseSize*limit/actual)+'px';if(draftCaptionPos){draftCaptionPos=clampCaptionPos(draftCaptionPos);paintCaptionOverlay()}})}
 document.fonts?.ready.then(()=>applyCaptionPreviewStyle());
 if(!localStorage.getItem('jiho.render.captionFont'))renderCaptionFont.value='nanum_brush';renderCaptionFont.onchange=()=>{localStorage.setItem('jiho.render.captionFont',renderCaptionFont.value);applyCaptionPreviewStyle()};
-renderPreview.onclick=async()=>{if(serverOnline===false)return alert('서버 연결이 끊겨 영상을 만들 수 없습니다');const musicVolume=Math.max(0,Math.min(200,+document.querySelector('#renderMusicVolume').value||0)),sourceVolume=Math.max(0,Math.min(200,+document.querySelector('#renderSourceVolume').value||0)),captionFont=renderCaptionFont.value,captionFontName=renderCaptionFont.selectedOptions[0].textContent,quality=renderQuality.value,qualityName=renderQuality.selectedOptions[0].textContent;if(!confirm(`${qualityName} 영상을 만들까요?\n섹션 시간에 맞추고, 빈 시간은 검은 화면으로 둡니다.\n노래 ${musicVolume}% · 정규화한 영상 원음 ${sourceVolume}% · ${captionFontName}`))return;try{const r=await fetch('/api/render-preview',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({music_volume:musicVolume/100,source_volume:sourceVolume/100,caption_font:captionFont,quality})}),j=await r.json();if(!j.ok)throw Error(j.error||'렌더링 시작 실패');paintRender(j)}catch(err){alert('영상 시작 실패: '+err.message)}};
+const renderHdr=document.querySelector('#renderHdr');renderHdr.checked=localStorage.getItem('jiho.render.hdr')!=='false';renderHdr.onchange=()=>localStorage.setItem('jiho.render.hdr',String(renderHdr.checked));
+renderPreview.onclick=async()=>{if(serverOnline===false)return alert('서버 연결이 끊겨 영상을 만들 수 없습니다');const musicVolume=Math.max(0,Math.min(200,+document.querySelector('#renderMusicVolume').value||0)),sourceVolume=Math.max(0,Math.min(200,+document.querySelector('#renderSourceVolume').value||0)),captionFont=renderCaptionFont.value,captionFontName=renderCaptionFont.selectedOptions[0].textContent,quality=renderQuality.value,qualityName=renderQuality.selectedOptions[0].textContent,hdr=renderHdr.checked,colorName=hdr?'10비트 HLG · HDR 원본 유지':'SDR 호환 변환';if(!confirm(`${qualityName} 영상을 만들까요?\n섹션 시간에 맞추고, 빈 시간은 검은 화면으로 둡니다.\n${colorName}\n노래 ${musicVolume}% · 정규화한 영상 원음 ${sourceVolume}% · ${captionFontName}`))return;try{const r=await fetch('/api/render-preview',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({music_volume:musicVolume/100,source_volume:sourceVolume/100,caption_font:captionFont,quality,hdr})}),j=await r.json();if(!j.ok)throw Error(j.error||'렌더링 시작 실패');paintRender(j)}catch(err){alert('영상 시작 실패: '+err.message)}};
 async function commitLayout(){layout.order=currentOrder();unsavedLayout=true;paintServer();const st=document.querySelector('#layoutStatus');st.textContent='저장 중…';sessionStorage.setItem('jiho.plot.scroll',scrollY);if(serverOnline===false){st.textContent='서버 연결 끊김 — 저장되지 않았습니다';paintServer();return}try{const r=await fetch('/api/plot-layout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(layout)}),j=await r.json();if(!j.ok)throw Error(j.error||'저장 실패');unsavedLayout=false;markSaved();location.reload()}catch(e){serverOnline=false;unsavedLayout=true;paintServer();st.textContent='저장 실패: '+e.message}}
 async function excludeFiles(rawFiles){const files=[...new Set(rawFiles)];if(!files.length)return;const detail=files.length===1?files[0]:`${files.length}개 사진·영상`;if(!confirm(`${detail}을 영상에서 제외할까요?\n메인 갤러리의 제외 레이블에도 반영됩니다.`))return;if(serverOnline===false){unsavedLayout=true;paintServer();return alert('서버 연결이 끊겨 제외를 저장할 수 없습니다')}try{for(const file of files){const r=await fetch('/api/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({file,pick:0})}),j=await r.json();if(!j.ok)throw Error(j.error||file+' 저장 실패')}const r=await fetch('/api/plan',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}),j=await r.json();if(!j.ok)throw Error(j.error||'콘티 재생성 실패');markSaved();location.reload()}catch(e){serverOnline=false;paintServer();alert('제외 저장 실패: '+e.message)}}
 async function reincludeFile(file){if(!confirm(`${file}을 영상에 다시 포함할까요?`))return;if(serverOnline===false)return alert('서버 연결이 끊겨 저장할 수 없습니다');try{const r=await fetch('/api/tag',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({file,pick:1})}),j=await r.json();if(!j.ok)throw Error(j.error||'저장 실패');const pr=await fetch('/api/plan',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}),pj=await pr.json();if(!pj.ok)throw Error(pj.error||'콘티 재생성 실패');markSaved();location.reload()}catch(e){serverOnline=false;paintServer();alert('다시 포함 저장 실패: '+e.message)}}
@@ -3613,6 +3923,9 @@ function endPointerDrag(e){const p=pointerDrag;if(!p||e.pointerId!==p.id)return;
 cards.forEach(c=>{const grip=c.querySelector('.dragGrip');grip.onpointerdown=e=>{if(e.button!==0||pointerDrag)return;e.preventDefault();e.stopPropagation();dragging=c;pointerDrag={card:c,id:e.pointerId,x:e.clientX,y:e.clientY,moved:false,target:null,zone:null,section:null,backlog:null,after:false};c.classList.add('dragging');document.body.classList.add('drag-active');grip.setPointerCapture?.(e.pointerId)};grip.onpointermove=movePointerDrag;grip.onpointerup=endPointerDrag;grip.onpointercancel=endPointerDrag});
 document.querySelectorAll('.fitMode').forEach(select=>select.onchange=()=>{layout.fit_modes[select.dataset.file]=select.value;commitLayout()});
 document.querySelectorAll('.effectMode').forEach(select=>select.onchange=()=>{layout.effects[select.dataset.file]=select.value;commitLayout()});
+document.querySelectorAll('.sectionEffectMode').forEach(select=>select.onchange=()=>{const section=select.closest('.story-section'),id=select.dataset.id,duration=section.querySelector('.sectionEffectDuration'),columns=section.querySelector('.sectionEffectColumnCount'),sectionSec=Math.max(.1,(+section.dataset.to||0)-(+section.dataset.from||0));if(select.value==='grid_rows'){layout.section_effects[id]={type:'grid_rows',seconds:Math.max(.1,Math.min(sectionSec,+duration.value||Math.min(6,sectionSec))),columns:Math.max(1,Math.min(20,Math.round(+columns.value||1)))}}else delete layout.section_effects[id];commitLayout()});
+document.querySelectorAll('.sectionEffectDuration').forEach(input=>input.onchange=()=>{const value=+input.value,id=input.dataset.id,effect=layout.section_effects[id],section=input.closest('.story-section'),sectionSec=Math.max(.1,(+section.dataset.to||0)-(+section.dataset.from||0));if(!effect||effect.type!=='grid_rows')return;if(!Number.isFinite(value)||value<.1||value>sectionSec)return alert(`행 페이드 총 시간은 0.1~${sectionSec.toFixed(2)}초로 입력해주세요`);effect.seconds=value;commitLayout()});
+document.querySelectorAll('.sectionEffectColumnCount').forEach(input=>input.onchange=()=>{const value=Math.round(+input.value),id=input.dataset.id,effect=layout.section_effects[id];if(!effect||effect.type!=='grid_rows')return;if(!Number.isFinite(value)||value<1||value>20)return alert('그리드 열 수는 1~20개로 입력해주세요');effect.columns=value;commitLayout()});
 document.querySelectorAll('.layoutMode').forEach(select=>select.onchange=()=>{layout.layouts[select.dataset.key]=select.value;commitLayout()});
 document.querySelectorAll('.dropStart').forEach(zone=>{zone.ondragover=e=>{if(!dragging)return;e.preventDefault();e.stopPropagation();zone.classList.add('drop-target')};zone.ondragleave=()=>zone.classList.remove('drop-target');zone.ondrop=e=>{e.preventDefault();e.stopPropagation();zone.classList.remove('drop-target');if(!dragging)return;const section=zone.closest('.story-section'),first=[...section.querySelectorAll('.cut')].find(c=>c!==dragging);assignToSection(dragging,section);if(first){recordRelativeOrder(dragging,first,false);first.before(dragging)}else zone.after(dragging);commitLayout()}});
 document.querySelectorAll('.story-section').forEach(section=>{const done=section.querySelector('.sectionDone input');done.onchange=()=>{done.checked?completedSections.add(section.dataset.id):completedSections.delete(section.dataset.id);saveSectionReview();progress()};section.ondragover=e=>{if(!dragging)return;e.preventDefault();document.querySelectorAll('.drop-target').forEach(x=>x.classList.toggle('drop-target',x===section))};section.ondragleave=e=>{if(!section.contains(e.relatedTarget))section.classList.remove('drop-target')};section.ondrop=e=>{if(e.target.closest('.cut,.dropStart'))return;e.preventDefault();section.classList.remove('drop-target');if(!dragging)return;assignToSection(dragging,section);section.querySelector('.cuts').appendChild(dragging);commitLayout()}});progress();
@@ -3633,14 +3946,14 @@ document.querySelectorAll('.removeSection').forEach(b=>b.onclick=e=>{e.stopPropa
 const sectionStartInputs=[...document.querySelectorAll('.sectionStart')];sectionStartInputs.forEach((input,i)=>{input.oninput=()=>{const value=+input.value;if(!Number.isFinite(value))return;const section=input.closest('.story-section');section.dataset.from=value;if(i){sectionStartInputs[i-1].closest('.story-section').dataset.to=value}paintRenderCoverage()};input.onchange=()=>{const value=+input.value,prev=i?+sectionStartInputs[i-1].value:-.01,next=i+1<sectionStartInputs.length?+sectionStartInputs[i+1].value:Infinity;if(!Number.isFinite(value)||value<prev+.01||value>next-.01){alert(`섹션 시작은 이전 ${prev.toFixed(2)}초보다 뒤, 다음 ${Number.isFinite(next)?next.toFixed(2):'끝'}초보다 앞이어야 합니다`);location.reload();return}layout.section_starts[input.dataset.id]=value;commitLayout()}});
 document.querySelectorAll('[data-f]').forEach(b=>b.onclick=()=>{document.body.dataset.filter=b.dataset.f;document.querySelectorAll('[data-f]').forEach(x=>x.classList.toggle('on',x===b))});
 document.querySelector('#clear').textContent='섹션 완료 초기화';document.querySelector('#clear').onclick=()=>{if(confirm('섹션 완료 체크를 모두 지울까요?')){completedSections.clear();saveSectionReview();progress()}};
-const modal=document.querySelector('#modal'),media=modal.querySelector('.modal-media'),prevCut=document.querySelector('#prevCut'),nextCut=document.querySelector('#nextCut'),saveCaptionPos=document.querySelector('#saveCaptionPos'),cropEdit=document.querySelector('#cropEdit'),panMediaBtn=document.querySelector('#panMediaBtn'),saveMediaPos=document.querySelector('#saveMediaPos'),captionPosX=document.querySelector('#captionPosX'),captionPosY=document.querySelector('#captionPosY'),mediaPositionRows=document.querySelector('#mediaPositionRows');let openIndex=-1,openSectionId='',draftCaptionPos=null,captionOverlayEl=null,panMode=false,draftMediaPositions={},mediaPositionInputs={};
-new MutationObserver(()=>{if(openIndex<0)return;const cut=CUTS[openIndex];[...media.querySelectorAll('.tile')].forEach((wrap,i)=>{const el=wrap.querySelector('img');if(!el)return;const tile=cut?.tiles?.[i];el.style.animation=tile?.effect==='zoom_in'?`gentleZoom ${Math.max(.2,+cut.dur||3)}s linear forwards`:'none'})}).observe(media,{childList:true,subtree:true});
+const modal=document.querySelector('#modal'),media=modal.querySelector('.modal-media'),prevCut=document.querySelector('#prevCut'),nextCut=document.querySelector('#nextCut'),saveCaptionPos=document.querySelector('#saveCaptionPos'),cropEdit=document.querySelector('#cropEdit'),panMediaBtn=document.querySelector('#panMediaBtn'),saveMediaPos=document.querySelector('#saveMediaPos'),captionPosX=document.querySelector('#captionPosX'),captionPosY=document.querySelector('#captionPosY'),mediaPositionRows=document.querySelector('#mediaPositionRows');let openIndex=-1,openSectionId='',draftCaptionPos=null,captionOverlayEl=null,captionRevealTimers=[],panMode=false,draftMediaPositions={},mediaPositionInputs={};
+new MutationObserver(()=>{if(openIndex<0)return;const cut=CUTS[openIndex];[...media.querySelectorAll('.tile')].forEach((wrap,i)=>{const el=wrap.querySelector('img');if(!el)return;const tile=cut?.tiles?.[i],name=tile?.effect==='zoom_in_12'?'gentleZoom12':tile?.effect==='zoom_in'?'gentleZoom':'';el.style.animation=name?`${name} ${Math.max(.2,+cut.dur||3)}s linear forwards`:'none'})}).observe(media,{childList:true,subtree:true});
 const storyCutIndices=()=>[...document.querySelectorAll('.story-section .cut')].map(c=>+c.dataset.i);
 function navigateStory(delta){const sequence=storyCutIndices(),pos=sequence.indexOf(openIndex),next=sequence[pos+delta];if(pos>=0&&next!==undefined)openCut(next)}
 modal.querySelector('.close').onclick=()=>modal.close();modal.onclick=e=>{if(e.target===modal)modal.close()};prevCut.onclick=()=>navigateStory(-1);nextCut.onclick=()=>navigateStory(1);saveCaptionPos.onclick=()=>{if(!openSectionId||!draftCaptionPos)return;layout.caption_positions['section:'+openSectionId]=draftCaptionPos;document.querySelector(`.story-section[data-id="${CSS.escape(openSectionId)}"]`)?.querySelectorAll('.cut').forEach(c=>delete layout.caption_positions[c.dataset.key]);commitLayout()};
 function clampCaptionPos(pos){if(!captionOverlayEl||!media.clientWidth||!media.clientHeight)return[pos[0],pos[1]];const minX=Math.min(.5,(captionOverlayEl.offsetWidth/2+7)/media.clientWidth),minY=Math.min(.5,(captionOverlayEl.offsetHeight/2+7)/media.clientHeight);let x=Math.max(minX,Math.min(1-minX,+pos[0]||0)),y=Math.max(minY,Math.min(1-minY,+pos[1]||0));if(Math.abs(x-.5)<.015)x=.5;if(Math.abs(y-.5)<.015)y=.5;return[x,y]}
 function syncCaptionCoords(){const enabled=!!draftCaptionPos;captionPosX.disabled=captionPosY.disabled=!enabled;if(enabled){captionPosX.value=(draftCaptionPos[0]*100).toFixed(1);captionPosY.value=(draftCaptionPos[1]*100).toFixed(1)}}function paintCaptionOverlay(){if(!captionOverlayEl||!draftCaptionPos)return;captionOverlayEl.style.left=(draftCaptionPos[0]*100)+'%';captionOverlayEl.style.top=(draftCaptionPos[1]*100)+'%';syncCaptionCoords()}function editCaptionCoords(){if(!draftCaptionPos)return;const x=+captionPosX.value/100,y=+captionPosY.value/100;if(!Number.isFinite(x)||!Number.isFinite(y))return;draftCaptionPos=clampCaptionPos([x,y]);paintCaptionOverlay()}captionPosX.oninput=captionPosY.oninput=editCaptionCoords;
-function addCaptionOverlay(c,text,sectionId){const caption=(text&&text!=='가사 없음')?text:'';saveCaptionPos.disabled=!caption||!sectionId;captionOverlayEl=null;if(!caption){draftCaptionPos=null;syncCaptionCoords();return}draftCaptionPos=[...(layout.caption_positions['section:'+sectionId]||c?.caption_position||[.5,.86])];const el=document.createElement('div');captionOverlayEl=el;el.className='caption-overlay';el.dataset.caption=caption;applyCaptionPreviewStyle();el.onpointerdown=e=>{el.setPointerCapture(e.pointerId);e.preventDefault();el.classList.add('moving');modal.classList.add('caption-moving')};el.onpointermove=e=>{if(!el.hasPointerCapture(e.pointerId))return;const r=media.getBoundingClientRect();draftCaptionPos=clampCaptionPos([(e.clientX-r.left)/r.width,(e.clientY-r.top)/r.height]);paintCaptionOverlay()};el.onpointerup=el.onpointercancel=e=>{if(el.hasPointerCapture(e.pointerId))el.releasePointerCapture(e.pointerId);el.classList.remove('moving');modal.classList.remove('caption-moving')};media.appendChild(el);requestAnimationFrame(()=>{applyCaptionPreviewStyle();draftCaptionPos=clampCaptionPos(draftCaptionPos);paintCaptionOverlay()})}
+function addCaptionOverlay(c,text,sectionId){captionRevealTimers.forEach(clearTimeout);captionRevealTimers=[];const parsed=parseCaptionCues(text),caption=(parsed.text&&parsed.text!=='가사 없음')?parsed.text:'';saveCaptionPos.disabled=!caption||!sectionId;captionOverlayEl=null;if(!caption){draftCaptionPos=null;syncCaptionCoords();return}let elapsed=0;if(c&&openIndex>=0){const card=cardFor(openIndex),siblings=[...(card?.closest('.cuts')?.querySelectorAll('.cut')||[])],at=siblings.indexOf(card);if(at>0)elapsed=siblings.slice(0,at).reduce((sum,item)=>sum+Math.max(0,+item.querySelector('.duration')?.value||0),0)}draftCaptionPos=[...(layout.caption_positions['section:'+sectionId]||c?.caption_position||[.5,.86])];const el=document.createElement('div');captionOverlayEl=el;el.className='caption-overlay';el.dataset.caption=caption;el.dataset.cued='1';el.style.whiteSpace='pre';parsed.chunks.forEach(cue=>{const span=document.createElement('span'),revealAfter=Math.max(0,cue.delay-elapsed);span.textContent=cue.text;span.style.transition='opacity .4s ease';span.style.opacity=revealAfter>0?'0':'1';el.appendChild(span);if(revealAfter>0)captionRevealTimers.push(setTimeout(()=>{if(captionOverlayEl===el)span.style.opacity='1'},revealAfter*1000))});applyCaptionPreviewStyle();el.onpointerdown=e=>{el.setPointerCapture(e.pointerId);e.preventDefault();el.classList.add('moving');modal.classList.add('caption-moving')};el.onpointermove=e=>{if(!el.hasPointerCapture(e.pointerId))return;const r=media.getBoundingClientRect();draftCaptionPos=clampCaptionPos([(e.clientX-r.left)/r.width,(e.clientY-r.top)/r.height]);paintCaptionOverlay()};el.onpointerup=el.onpointercancel=e=>{if(el.hasPointerCapture(e.pointerId))el.releasePointerCapture(e.pointerId);el.classList.remove('moving');modal.classList.remove('caption-moving')};media.appendChild(el);requestAnimationFrame(()=>{applyCaptionPreviewStyle();draftCaptionPos=clampCaptionPos(draftCaptionPos);paintCaptionOverlay()})}
 function keepInsideClip(el,clip){if(!clip)return;const [start,end]=clip,nearEnd=Math.max(start,end-.03);el.addEventListener('play',()=>{if(el.currentTime<start||el.currentTime>=end)el.currentTime=start});el.addEventListener('seeking',()=>{if(el.currentTime<start-.03)el.currentTime=start;else if(el.currentTime>end)el.currentTime=nearEnd});el.addEventListener('timeupdate',()=>{if(!el.paused&&el.currentTime>=end-.03){el.pause();el.currentTime=start}})}
 function mediaGeometry(el,frame,t){const nw=el.naturalWidth||el.videoWidth,nh=el.naturalHeight||el.videoHeight,aw=frame.clientWidth,ah=frame.clientHeight;if(!nw||!nh||!aw||!ah)return null;const rot=+(t.rotation||0),swap=rot%180!==0,ow=swap?nh:nw,oh=swap?nw:nh,safe=Array.isArray(t.safe)&&t.safe.length===4?t.safe:null;let baseW=ow,baseH=oh,cx=ow/2,cy=oh/2;if(safe){baseW=Math.max(.01,(safe[2]-safe[0])*ow);baseH=Math.max(.01,(safe[3]-safe[1])*oh);cx=(safe[0]+safe[2])/2*ow;cy=(safe[1]+safe[3])/2*oh}const scale=t.fit==='cover'?Math.max(aw/baseW,ah/baseH):Math.min(aw/baseW,ah/baseH);return{nw,nh,aw,ah,ow,oh,baseW,baseH,cx,cy,scale,rot,gapX:Math.max(0,aw-baseW*scale),gapY:Math.max(0,ah-baseH*scale)}}
 function fitEditedMedia(el,frame,t){const paint=()=>{const g=mediaGeometry(el,frame,t);if(!g)return;const pos=Array.isArray(t.media_position)?t.media_position:[.5,.5],targetX=g.baseW*g.scale/2+g.gapX*Math.max(0,Math.min(1,+pos[0]||0)),targetY=g.baseH*g.scale/2+g.gapY*Math.max(0,Math.min(1,+pos[1]||0));el.style.width=(g.nw*g.scale)+'px';el.style.height=(g.nh*g.scale)+'px';el.style.left=(targetX-(g.cx-g.ow/2)*g.scale)+'px';el.style.top=(targetY-(g.cy-g.oh/2)*g.scale)+'px';el.style.maxWidth='none';el.style.maxHeight='none';el.style.position='absolute';el.style.transform=`translate(-50%,-50%) rotate(${g.rot}deg)`;el.style.transformOrigin='center'};if(el.tagName==='IMG'&&el.complete)requestAnimationFrame(paint);else if(el.tagName==='VIDEO'&&el.readyState>=1)requestAnimationFrame(paint);else el.addEventListener(el.tagName==='IMG'?'load':'loadedmetadata',()=>requestAnimationFrame(paint),{once:true})}
@@ -3648,10 +3961,10 @@ document.querySelectorAll('.cut .thumb-cell img').forEach(img=>{const card=img.c
 function setPanMode(on){panMode=!!on;modal.classList.toggle('pan-mode',panMode);panMediaBtn.classList.toggle('on',panMode);panMediaBtn.textContent=panMode?'위치 이동 중 · 끝내기':'사진·영상 위치 이동'}panMediaBtn.onclick=()=>setPanMode(!panMode);saveMediaPos.onclick=()=>{Object.entries(draftMediaPositions).forEach(([file,pos])=>layout.media_positions[file]=pos);commitLayout()};
 function syncMediaCoords(file,pos){const inputs=mediaPositionInputs[file];if(inputs){inputs[0].value=(pos[0]*100).toFixed(1);inputs[1].value=(pos[1]*100).toFixed(1)}}function addMediaPositionRow(t,wrap,el){const row=document.createElement('div');row.className='mediaPositionRow';const name=document.createElement('b');name.textContent=t.file;name.title=t.file;row.appendChild(name);const inputs=[];['X','Y'].forEach((axis,i)=>{const label=document.createElement('label'),input=document.createElement('input');label.append(axis+' ');input.type='number';input.min='0';input.max='100';input.step='.1';label.append(input,'%');row.appendChild(label);inputs.push(input)});const hint=document.createElement('small');hint.textContent='남는 여백 안 위치';row.appendChild(hint);mediaPositionRows.appendChild(row);mediaPositionInputs[t.file]=inputs;const pos=Array.isArray(t.media_position)?t.media_position:[.5,.5];syncMediaCoords(t.file,pos);const apply=()=>{const x=+inputs[0].value/100,y=+inputs[1].value/100;if(!Number.isFinite(x)||!Number.isFinite(y))return;const next=[Math.max(0,Math.min(1,x)),Math.max(0,Math.min(1,y))];t.media_position=next;draftMediaPositions[t.file]=next;saveMediaPos.disabled=false;fitEditedMedia(el,wrap,t)};inputs.forEach(input=>input.oninput=apply);const refreshAxes=()=>{const g=mediaGeometry(el,wrap,t);if(!g)return;inputs[0].disabled=g.gapX<1;inputs[1].disabled=g.gapY<1;hint.textContent=g.gapX>=1&&g.gapY>=1?'좌우·상하 여백 안 위치':g.gapX>=1?'좌우 여백 안 위치':g.gapY>=1?'상하 여백 안 위치':'남는 여백 없음'};if((el.tagName==='IMG'&&el.complete)||(el.tagName==='VIDEO'&&el.readyState>=1))requestAnimationFrame(refreshAxes);else el.addEventListener(el.tagName==='IMG'?'load':'loadedmetadata',refreshAxes,{once:true})}
 function enableMediaPan(wrap,el,t){let drag=null;wrap.onpointerdown=e=>{if(!panMode||e.button!==0)return;const g=mediaGeometry(el,wrap,t);if(!g||(g.gapX<1&&g.gapY<1))return;e.preventDefault();e.stopPropagation();const start=Array.isArray(t.media_position)?[...t.media_position]:[.5,.5];drag={id:e.pointerId,x:e.clientX,y:e.clientY,start,g};wrap.setPointerCapture(e.pointerId)};wrap.onpointermove=e=>{if(!drag||e.pointerId!==drag.id)return;e.preventDefault();const pos=[drag.g.gapX>=1?Math.max(0,Math.min(1,drag.start[0]+(e.clientX-drag.x)/drag.g.gapX)):drag.start[0],drag.g.gapY>=1?Math.max(0,Math.min(1,drag.start[1]+(e.clientY-drag.y)/drag.g.gapY)):drag.start[1]];t.media_position=pos;draftMediaPositions[t.file]=pos;syncMediaCoords(t.file,pos);saveMediaPos.disabled=false;fitEditedMedia(el,wrap,t)};wrap.onpointerup=wrap.onpointercancel=e=>{if(drag&&e.pointerId===drag.id)drag=null}}
-function openCut(i){if(i<0||i>=CUTS.length)return;media.querySelectorAll('video').forEach(v=>v.pause());openIndex=i;const c=CUTS[i],story=cardFor(i)?.closest('.story-section'),section=story?.dataset.title||'미배치 슬라이드',sectionLyric=story?.dataset.lyric||'',sequence=storyCutIndices(),storyPos=sequence.indexOf(i),position=storyPos>=0?`콘티 ${storyPos+1}/${sequence.length}`:'미배치 미리보기';openSectionId=story?.dataset.id||'';modal.querySelector('h2').textContent=`${section}${sectionLyric&&sectionLyric!=='가사 없음'?' · '+sectionLyric:''} | ${position} · ${c.caption||'영상 자막 없음'}`;cropEdit.href='index.html?file='+encodeURIComponent(c.tiles[0].file);cropEdit.hidden=false;prevCut.disabled=storyPos<=0;nextCut.disabled=storyPos<0||storyPos===sequence.length-1;media.innerHTML='';mediaPositionRows.innerHTML='';mediaPositionInputs={};setPanMode(false);panMediaBtn.disabled=false;draftMediaPositions={};saveMediaPos.disabled=true;c.tiles.forEach(t=>{const wrap=document.createElement('div'),cell=t.cell||[0,0,1,1];wrap.className='tile';wrap.style.left=(cell[0]*100)+'%';wrap.style.top=(cell[1]*100)+'%';wrap.style.width=(cell[2]*100)+'%';wrap.style.height=(cell[3]*100)+'%';let el;if(t.kind==='image'){el=document.createElement('img');el.src=t.path}else{el=document.createElement('video');el.src=t.path;el.controls=true;el.autoplay=true;el.playsInline=true;const clip=t.clip;keepInsideClip(el,clip);el.addEventListener('loadedmetadata',()=>{if(clip)el.currentTime=clip[0];el.play().catch(()=>{})})}wrap.appendChild(el);media.appendChild(wrap);fitEditedMedia(el,wrap,t);enableMediaPan(wrap,el,t);addMediaPositionRow(t,wrap,el)});addCaptionOverlay(c,sectionLyric,openSectionId);if(!modal.open)modal.showModal()}
+function openCut(i){if(i<0||i>=CUTS.length)return;media.querySelectorAll('video').forEach(v=>v.pause());openIndex=i;const c=CUTS[i],story=cardFor(i)?.closest('.story-section'),section=story?.dataset.title||'미배치 슬라이드',sectionLyric=story?.dataset.lyric||'',displayLyric=parseCaptionDelay(sectionLyric).text,sequence=storyCutIndices(),storyPos=sequence.indexOf(i),position=storyPos>=0?`콘티 ${storyPos+1}/${sequence.length}`:'미배치 미리보기';openSectionId=story?.dataset.id||'';modal.querySelector('h2').textContent=`${section}${displayLyric&&displayLyric!=='가사 없음'?' · '+displayLyric:''} | ${position} · ${c.caption||'영상 자막 없음'}`;cropEdit.href='index.html?file='+encodeURIComponent(c.tiles[0].file);cropEdit.hidden=false;prevCut.disabled=storyPos<=0;nextCut.disabled=storyPos<0||storyPos===sequence.length-1;media.innerHTML='';mediaPositionRows.innerHTML='';mediaPositionInputs={};setPanMode(false);panMediaBtn.disabled=false;draftMediaPositions={};saveMediaPos.disabled=true;c.tiles.forEach(t=>{const wrap=document.createElement('div'),cell=t.cell||[0,0,1,1];wrap.className='tile';wrap.style.left=(cell[0]*100)+'%';wrap.style.top=(cell[1]*100)+'%';wrap.style.width=(cell[2]*100)+'%';wrap.style.height=(cell[3]*100)+'%';let el;if(t.kind==='image'){el=document.createElement('img');el.src=t.path}else{el=document.createElement('video');el.src=t.path;el.controls=true;el.autoplay=true;el.playsInline=true;const clip=t.clip;keepInsideClip(el,clip);el.addEventListener('loadedmetadata',()=>{if(clip)el.currentTime=clip[0];el.play().catch(()=>{})})}wrap.appendChild(el);media.appendChild(wrap);fitEditedMedia(el,wrap,t);enableMediaPan(wrap,el,t);addMediaPositionRow(t,wrap,el)});addCaptionOverlay(c,sectionLyric,openSectionId);if(!modal.open)modal.showModal()}
 function openSectionCaptionEditor(section){media.querySelectorAll('video').forEach(v=>v.pause());openIndex=-1;openSectionId=section.dataset.id;modal.querySelector('h2').textContent=`${section.dataset.title} · 검은 화면 자막 위치`;cropEdit.hidden=true;prevCut.disabled=nextCut.disabled=true;media.innerHTML='';mediaPositionRows.innerHTML='';mediaPositionInputs={};setPanMode(false);panMediaBtn.disabled=true;draftMediaPositions={};saveMediaPos.disabled=true;addCaptionOverlay(null,section.dataset.lyric,openSectionId);if(!modal.open)modal.showModal()}document.querySelectorAll('.editSectionCaptionPos').forEach(button=>button.onclick=e=>{e.stopPropagation();openSectionCaptionEditor(button.closest('.story-section'))});
 document.addEventListener('keydown',e=>{if(!modal.open)return;if(e.key==='ArrowLeft'){e.preventDefault();navigateStory(-1)}else if(e.key==='ArrowRight'){e.preventDefault();navigateStory(1)}});
-modal.addEventListener('close',()=>{media.querySelectorAll('video').forEach(v=>v.pause());setPanMode(false);modal.classList.remove('caption-moving');openIndex=-1;openSectionId=''});</script></body></html>'''
+modal.addEventListener('close',()=>{captionRevealTimers.forEach(clearTimeout);captionRevealTimers=[];media.querySelectorAll('video').forEach(v=>v.pause());setPanMode(false);modal.classList.remove('caption-moving');openIndex=-1;openSectionId=''});</script></body></html>'''
     summary = (f'{plan["cuts"]}화면 · {plan["photos"]}컷 · '
                f'{_plot_time(plan["total_sec"])} · 목표 {_plot_time(plan["target_sec"])}')
     out = (template.replace("{{SUMMARY}}", html.escape(summary))
