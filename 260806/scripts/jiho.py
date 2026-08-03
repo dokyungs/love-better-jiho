@@ -259,6 +259,7 @@ FFMPEG_FULL = Path("/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg")
 FFPROBE_FULL = Path("/opt/homebrew/opt/ffmpeg-full/bin/ffprobe")
 FFMPEG_BIN = str(FFMPEG_FULL if FFMPEG_FULL.is_file() else (shutil.which("ffmpeg") or "ffmpeg"))
 FFPROBE_BIN = str(FFPROBE_FULL if FFPROBE_FULL.is_file() else (shutil.which("ffprobe") or "ffprobe"))
+AVCONVERT_BIN = Path("/usr/bin/avconvert")
 RENDER_FONTS = {
     "maru_buri": ROOT / "fonts" / "MaruBuri-SemiBold.ttf",
     "nanum_myeongjo": ROOT / "fonts" / "NanumMyeongjo-Regular.ttf",
@@ -489,6 +490,36 @@ def _video_color_info(path):
     return stream
 
 
+def _apple_sdr_proxy(path):
+    """Apple AVFoundation 색관리로 HDR 영상을 BT.709 SDR 프록시로 만든다."""
+    path = Path(path)
+    if not AVCONVERT_BIN.is_file():
+        raise RuntimeError("Apple HDR→SDR 변환 도구(/usr/bin/avconvert)를 찾지 못했습니다")
+    stat = path.stat()
+    signature = f"{path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}"
+    key = hashlib.sha256(signature.encode("utf-8")).hexdigest()[:20]
+    cache_dir = RENDER_DIR / "sdr-cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    dest = cache_dir / f"{path.stem}-{key}.m4v"
+    if dest.is_file() and dest.stat().st_size > 0:
+        return dest
+    temp = cache_dir / f".{dest.name}.tmp.m4v"
+    temp.unlink(missing_ok=True)
+    _set_render_status(message=f"Apple 색관리 HDR→SDR 변환 중 · {path.name}")
+    result = subprocess.run(
+        [str(AVCONVERT_BIN), "--source", str(path),
+         "--preset", "Preset1920x1080", "--output", str(temp),
+         "--replace", "--disableMetadataFilter"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if result.returncode or not temp.is_file() or temp.stat().st_size == 0:
+        temp.unlink(missing_ok=True)
+        tail = (result.stderr or "")[-2000:].strip()
+        raise RuntimeError(f"Apple HDR→SDR 변환 실패: {path.name}" +
+                           (f"\n{tail}" if tail else ""))
+    temp.replace(dest)
+    return dest
+
+
 def _render_segment(cut, duration, fade, dest, lyric="", caption_font="nanum_brush",
                     caption_position=None, caption_elapsed=0.0, hdr=False):
     """컷 하나를 선택한 16:9 렌더 프레임으로 정규화한다."""
@@ -500,15 +531,22 @@ def _render_segment(cut, duration, fade, dest, lyric="", caption_font="nanum_bru
         path = ROOT / str(tile.get("path") or "")
         if not path.exists():
             raise FileNotFoundError(f"원본을 찾을 수 없습니다: {tile.get('path')}")
+        input_path = path
+        if (not hdr and tile.get("kind") != "image" and
+                _video_color_info(path).get("is_hdr")):
+            # FFmpeg 안에서 Apple 필터를 호출하면 10비트 HLG 입력이 먼저 8비트로
+            # 협상되어 Safari와 다른 결과가 난다. AVFoundation이 파일 전체를
+            # 정식 SDR로 변환한 프록시를 영상 입력으로 사용한다.
+            input_path = _apple_sdr_proxy(path)
         if tile.get("kind") == "image":
             # 정지 이미지 입력도 출력과 같은 프레임률로 생성해야 fps 필터에서
             # 주기적으로 프레임이 복제·삭제되어 줌이 떨리는 현상이 생기지 않는다.
             cmd += ["-loop", "1", "-framerate", str(RENDER_FPS),
-                    "-t", f"{segment_duration:.3f}", "-i", str(path)]
+                    "-t", f"{segment_duration:.3f}", "-i", str(input_path)]
         else:
             clip = tile.get("clip") or [0, None]
             start = max(0.0, float(clip[0] or 0))
-            cmd += ["-ss", f"{start:.3f}", "-i", str(path)]
+            cmd += ["-ss", f"{start:.3f}", "-i", str(input_path)]
 
     pixel_format = "yuv420p10le" if hdr else "yuv420p"
     color_tag = ("setparams=range=limited:color_primaries=bt2020:"
@@ -532,13 +570,6 @@ def _render_segment(cut, duration, fade, dest, lyric="", caption_font="nanum_bru
                              f"iw*{sx1:.8f}:ih*{sy1:.8f}")
         source_info = (_video_color_info(path) if tile.get("kind") != "image" else {})
         source_is_hdr = bool(source_info.get("is_hdr"))
-        if not hdr and source_is_hdr:
-            # Safari/AVFoundation과 같은 Apple 색관리 계열의 시스템 톤매퍼가
-            # 원본 HLG/PQ 메타데이터와 콘텐츠 헤드룸을 읽어 표준 SDR로 내린다.
-            # 고정 peak luminance나 경험적 밝기 배율을 직접 적용하지 않는다.
-            chain += ["coreimage=filter=CISystemToneMap@inputDisplayHeadroom=1"
-                      "@inputPreferredDynamicRange=kCIDynamicRangeStandard",
-                      "format=yuv420p"]
         if tile.get("kind") == "image" and tile.get("effect") in ("zoom_in", "zoom_in_12"):
             frames = max(2, int(round(segment_duration * RENDER_FPS)))
             zoom_factor = 1.12 if tile.get("effect") == "zoom_in_12" else 1.06
@@ -687,14 +718,28 @@ def _render_segment(cut, duration, fade, dest, lyric="", caption_font="nanum_bru
             alpha_expr = (f"clip((t-({fade_start:.6f}))/{CAPTION_FADE_SECONDS:.3f},0,1)"
                           if fade_start > -CAPTION_FADE_SECONDS else "1")
             output = "outv" if group_i == len(draw_chunks) - 1 else f"caption{group_i + 1}"
-            filters.append(f"[{previous}]drawtext=fontfile='{font}':textfile='{lyric_file}':"
+            shadow = f"captionShadow{group_i}"
+            shadowed = f"captionShadowed{group_i}"
+            shadow_blur = max(2.0, 4.5 * font_scale)
+            # 웹 미리보기의 두 겹 blurred text-shadow처럼 투명 레이어에 자막
+            # 그림자를 따로 그린 뒤 부드럽게 흐리고, 그 위에 선명한 글자를 얹는다.
+            filters.append(
+                f"color=c=black@0:s={RENDER_WIDTH}x{RENDER_HEIGHT}:r={RENDER_FPS}:"
+                f"d={segment_duration:.3f},format=rgba,"
+                f"drawtext=fontfile='{font}':textfile='{lyric_file}':"
+                f"fontcolor=black@.72:fontsize={style['size']}:"
+                f"line_spacing={style['line_spacing']}:boxw={chunk_width}:"
+                f"text_align=L:x='{x_expr}':y='{y_expr}':alpha='{alpha_expr}':"
+                f"fix_bounds=true,gblur=sigma={shadow_blur:.2f}:steps=2[{shadow}]")
+            filters.append(f"[{previous}][{shadow}]overlay=0:0:shortest=1[{shadowed}]")
+            filters.append(f"[{shadowed}]drawtext=fontfile='{font}':textfile='{lyric_file}':"
                            f"fontcolor=white:fontsize={style['size']}:"
                            f"line_spacing={style['line_spacing']}:boxw={chunk_width}:"
                            f"text_align=L:x='{x_expr}':y='{y_expr}':alpha='{alpha_expr}':"
                            f"fix_bounds=true:borderw={style['border']}:bordercolor=black@0:"
                            f"shadowx={max(1, round(font_scale))}:"
                            f"shadowy={max(1, round(2 * font_scale))}:"
-                           f"shadowcolor=black@.70[{output}]")
+                           f"shadowcolor=black@.42[{output}]")
             previous = output
     else:
         filters.append(f"[{base}]trim=duration={segment_duration:.3f},"
