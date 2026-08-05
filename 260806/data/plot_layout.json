@@ -876,7 +876,7 @@
     "lyric-14": "조그마한 발바닥이\n너를 옮긴다"
   },
   "fit_modes": {
-    "PXL_20250213_120634523.jpg": "pillarbox",
+    "PXL_20250213_120634523.jpg": "cover",
     "PXL_20250901_123520347.jpg": "cover",
     "PXL_20250811_003349046.jpg": "cover",
     "PXL_20251230_140826086.jpg": "cover",
@@ -917,7 +917,9 @@
     "PXL_20260401_082107304.mp4": "cover",
     "PXL_20250915_224447014.jpg": "cover",
     "DSCF0540.JPG": "cover",
-    "PXL_20250821_105810381.jpg": "cover"
+    "PXL_20250821_105810381.jpg": "cover",
+    "PXL_20250808_111239643.jpg": "cover",
+    "PXL_20250213_122222049.jpg": "pillarbox"
   },
   "layouts": {
     "PXL_20260402_000548215.jpg|DSCF8139.JPG|PXL_20260402_061152553.jpg": "hero_right3"
